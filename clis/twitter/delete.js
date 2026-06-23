@@ -7,14 +7,27 @@ function buildDeleteScript(tweetId) {
       try {
           const visible = (el) => !!el && (el.offsetParent !== null || el.getClientRects().length > 0);
           ${buildTwitterArticleScopeSource(tweetId)}
-          const targetArticle = findTargetArticle();
+          // The article and its self-referential /status/<id> link can hydrate
+          // after primaryColumn appears (slow networks render the card late), so
+          // poll briefly instead of failing on the first miss.
+          let targetArticle = findTargetArticle();
+          for (let __i = 0; !targetArticle && __i < 20; __i++) {
+              await new Promise(r => setTimeout(r, 250));
+              targetArticle = findTargetArticle();
+          }
 
           if (!targetArticle) {
               return { ok: false, message: 'Could not find the tweet card matching the requested URL.' };
           }
 
           const buttons = Array.from(targetArticle.querySelectorAll('button,[role="button"]'));
-          const moreMenu = buttons.find((el) => visible(el) && (el.getAttribute('aria-label') || '').trim() === 'More');
+          // X localizes the More caret's aria-label (e.g. "更多" in zh-Hans), so an
+          // exact === 'More' match fails on non-English UIs. Prefer the language-agnostic
+          // data-testid="caret", and fall back to a multilingual aria-label match.
+          let moreMenu = targetArticle.querySelector('[data-testid="caret"]');
+          if (!moreMenu || !visible(moreMenu)) {
+              moreMenu = buttons.find((el) => visible(el) && /^(More|更多)/.test((el.getAttribute('aria-label') || '').trim()));
+          }
           if (!moreMenu) {
               return { ok: false, message: 'Could not find the "More" context menu on the matched tweet. Are you sure you are logged in and looking at a valid tweet?' };
           }
@@ -25,7 +38,7 @@ function buildDeleteScript(tweetId) {
           const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
           const deleteBtn = items.find((item) => {
               const text = (item.textContent || '').trim();
-              return text.includes('Delete') && !text.includes('List');
+              return (text.includes('Delete') || text.includes('删除')) && !text.includes('List') && !text.includes('列表');
           });
 
           if (!deleteBtn) {
