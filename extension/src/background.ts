@@ -1026,7 +1026,11 @@ async function ensureOwnedContainerWindowUnlocked(
 
   const startUrl = (initialUrl && isSafeNavigationUrl(initialUrl)) ? initialUrl : BLANK_PAGE;
 
-  // macOS may activate Chrome even when a new normal window uses focused:false.
+  // macOS may activate Chrome even when a new normal window uses focused:false,
+  // and when the user's active Chrome window is fullscreen the new window joins
+  // fullscreen and takes focus. Create background windows minimized instead.
+  // Do not pass `focused` here: focused:false makes Chrome show the window via
+  // ShowInactive(), which drops the minimized initial state on macOS.
   // Minimized windows cannot include bounds, so size only foreground windows.
   const createData: chrome.windows.CreateData = mode === 'background'
     ? {
