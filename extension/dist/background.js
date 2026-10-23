@@ -1589,19 +1589,13 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
     };
   }
   const startUrl = initialUrl && isSafeNavigationUrl(initialUrl) ? initialUrl : BLANK_PAGE;
-  const createData = mode === "background" ? {
+  const win = await chrome.windows.create({
     url: startUrl,
-    focused: false,
-    state: "minimized",
-    type: "normal"
-  } : {
-    url: startUrl,
-    focused: true,
+    focused: mode === "foreground",
     width: 1280,
     height: 900,
     type: "normal"
-  };
-  const win = await chrome.windows.create(createData);
+  });
   container.windowId = win.id;
   await persistRuntimeState();
   console.log(`[opencli] Created owned ${role} window ${container.windowId} (start=${startUrl})`);
