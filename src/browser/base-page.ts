@@ -35,9 +35,18 @@ import {
   type TargetMatchLevel,
 } from './target-resolver.js';
 import { TargetError, type TargetErrorCode } from './target-errors.js';
-import { CliError } from '../errors.js';
+import { CliError, CommandExecutionError } from '../errors.js';
 import { formatSnapshot } from '../snapshotFormatter.js';
 import { installVisualRefOverlayJs, removeVisualRefOverlayJs } from './visual-refs.js';
+
+export const NATIVE_INPUT_VISIBILITY_JS = 'document.visibilityState';
+
+export class NativeInputVisibilityError extends CommandExecutionError {
+  constructor() {
+    super('Native input requires a visible browser page; input was not dispatched.',
+      'Select the target tab and restore/uncover its browser window, then retry.');
+  }
+}
 
 export interface ResolveSuccess {
   matches_n: number;
@@ -47,6 +56,25 @@ export interface ResolveSuccess {
    * clean `exact` match — the page changed, the action still succeeded.
    */
   match_level: TargetMatchLevel;
+  /**
+   * Which physical click path executed: `cdp` (trusted Input.dispatchMouseEvent),
+   * `js` (el.click() fallback), or `ax` (accessibility-node click). Surfaced so
+   * agents can tell a trusted synthetic click from the untrusted JS fallback.
+   */
+  click_method?: 'cdp' | 'js' | 'ax';
+  /**
+   * Result of hit-testing the click point against the resolved element:
+   * `target` (the point lands on the element or a descendant — trustworthy),
+   * `other` (an overlay/sibling covers it — the CDP click would miss), or
+   * `none` (nothing at the point). Only set on click().
+   */
+  hit?: 'target' | 'ancestor' | 'other' | 'none';
+  /**
+   * True when the click was retargeted from the resolved element to a nearby
+   * clickable ancestor (e.g. an <svg> icon whose click handler lives on the
+   * wrapping <div>), so the handler actually fires. See issue #2071.
+   */
+  retargeted?: boolean;
 }
 
 export interface FillTextResult extends ResolveSuccess {
@@ -296,32 +324,45 @@ export abstract class BasePage implements IPage {
     // Phase 2: measure first so native click can run before DOM el.click().
     // Custom dropdowns often listen to pointer/mouse down/up; DOM el.click()
     // only fires click and can silently report success without opening/selecting.
-    const rect = await this.evaluate(boundingRectResolvedJs({ skipScroll: nativeScrolled })) as
-      | { x: number; y: number; w: number; h: number; visible: boolean }
+    const rect = await this.evaluate(boundingRectResolvedJs({ skipScroll: nativeScrolled, forClick: true })) as
+      | { x: number; y: number; w: number; h: number; visible: boolean; hit?: 'target' | 'ancestor' | 'other' | 'none'; retargeted?: boolean }
       | null;
+    const meta = { hit: rect?.hit, retargeted: rect?.retargeted } as const;
 
-    if (rect?.visible === true) {
+    // Trust a CDP click when the point hit-tests onto the target, a descendant,
+    // or an ancestor (open shadow-DOM host / own wrapper — CDP still reaches the
+    // target there). Only an unrelated overlay ('other') forces the el.click()
+    // fallback, which dispatches straight on the node. See issues #2076/#2071.
+    if (rect?.visible === true && (rect.hit === 'target' || rect.hit === 'ancestor')) {
       const success = await this.tryNativeClick(rect.x, rect.y);
-      if (success) return resolved;
+      if (success) return { ...resolved, click_method: 'cdp', ...meta };
     }
 
-    // JS fallback for older backends or zero-rect targets.
+    // JS fallback: el.click() dispatches straight on __resolved, bypassing the
+    // occluding overlay (also covers older backends / zero-rect targets).
     const result = await this.evaluate(clickResolvedJs({ skipScroll: nativeScrolled })) as
       | string
       | { status: string; x?: number; y?: number; w?: number; h?: number; error?: string }
       | null;
 
-    if (typeof result === 'string' || result == null) return resolved;
+    if (typeof result === 'string' || result == null) return { ...resolved, click_method: 'js', ...meta };
 
-    if (result.status === 'clicked') return resolved;
+    if (result.status === 'clicked') return { ...resolved, click_method: 'js', ...meta };
 
     // JS click failed — try CDP native click if coordinates available
     if (result.x != null && result.y != null) {
       const success = await this.tryNativeClick(result.x, result.y);
-      if (success) return resolved;
+      if (success) return { ...resolved, click_method: 'cdp', ...meta };
     }
 
     throw new Error(`Click failed: ${result.error ?? 'JS click and CDP fallback both failed'}`);
+  }
+
+  protected async assertNativeInputVisible(): Promise<void> {
+    let visibility: unknown;
+    try { visibility = await this.evaluate(NATIVE_INPUT_VISIBILITY_JS); }
+    catch { throw new NativeInputVisibilityError(); }
+    if (visibility !== 'visible') throw new NativeInputVisibilityError();
   }
 
   /** Uses native CDP click support when the concrete page exposes it. */
@@ -331,7 +372,8 @@ export abstract class BasePage implements IPage {
     try {
       await nativeClick.call(this, x, y);
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof NativeInputVisibilityError) throw error;
       return false;
     }
   }
@@ -339,6 +381,7 @@ export abstract class BasePage implements IPage {
   protected async tryNativeMouseMove(x: number, y: number): Promise<boolean> {
     const cdp = (this as IPage).cdp;
     if (typeof cdp !== 'function') return false;
+    await this.assertNativeInputVisible();
     try {
       await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
       return true;
@@ -350,6 +393,7 @@ export abstract class BasePage implements IPage {
   protected async tryNativeDoubleClick(x: number, y: number): Promise<boolean> {
     const cdp = (this as IPage).cdp;
     if (typeof cdp !== 'function') return false;
+    await this.assertNativeInputVisible();
     try {
       await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
       await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
@@ -365,6 +409,7 @@ export abstract class BasePage implements IPage {
   protected async tryNativeDrag(from: { x: number; y: number }, to: { x: number; y: number }): Promise<boolean> {
     const cdp = (this as IPage).cdp;
     if (typeof cdp !== 'function') return false;
+    await this.assertNativeInputVisible();
     const midX = Math.round((from.x + to.x) / 2);
     const midY = Math.round((from.y + to.y) / 2);
     try {
@@ -390,8 +435,9 @@ export abstract class BasePage implements IPage {
     if (!resolved) return null;
     try {
       await nativeClick.call(this, resolved.x, resolved.y);
-      return { matches_n: 1, match_level: resolved.matchLevel };
-    } catch {
+      return { matches_n: 1, match_level: resolved.matchLevel, click_method: 'ax' };
+    } catch (error) {
+      if (error instanceof NativeInputVisibilityError) throw error;
       return null;
     }
   }
@@ -468,7 +514,8 @@ export abstract class BasePage implements IPage {
     try {
       await nativeKeyPress.call(this, key, modifiers);
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof NativeInputVisibilityError) throw error;
       return false;
     }
   }
@@ -1029,6 +1076,18 @@ export abstract class BasePage implements IPage {
     return [];
   }
 
+  /**
+   * Pure client-side sleep — a bare setTimeout with no page evaluation.
+   *
+   * Unlike `wait(n)`, this never installs a MutationObserver or touches the
+   * renderer, so poll loops that already re-check state each iteration don't
+   * pay for a whole-body DOM-stable probe on every tick. Use this for fixed
+   * poll intervals; use `wait(n)` when DOM-stable early return is desired.
+   */
+  async sleep(seconds: number): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+  }
+
   async wait(options: number | WaitOptions): Promise<void> {
     if (typeof options === 'number') {
       if (options >= 1) {
@@ -1194,6 +1253,66 @@ export abstract class BasePage implements IPage {
     if (opts.raw) return raw;
     if (typeof raw === 'string') return formatSnapshot(raw, opts);
     return raw;
+  }
+}
+
+export abstract class CDPBasePage extends BasePage {
+  abstract cdp(method: string, params?: Record<string, unknown>): Promise<unknown>;
+
+  async handleJavaScriptDialog(accept: boolean, promptText?: string): Promise<void> {
+    await this.cdp('Page.handleJavaScriptDialog', {
+      accept,
+      ...(promptText !== undefined && { promptText }),
+    });
+  }
+
+  async nativeClick(x: number, y: number): Promise<void> {
+    await this.assertNativeInputVisible();
+    await this.cdp('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x,
+      y,
+    });
+    await this.cdp('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x,
+      y,
+      button: 'left',
+      clickCount: 1,
+    });
+    await this.cdp('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x,
+      y,
+      button: 'left',
+      clickCount: 1,
+    });
+  }
+
+  async nativeType(text: string): Promise<void> {
+    // Use Input.insertText for reliable Unicode/CJK text insertion
+    await this.cdp('Input.insertText', { text });
+  }
+
+  async nativeKeyPress(key: string, modifiers: string[] = []): Promise<void> {
+    await this.assertNativeInputVisible();
+    let modifierFlags = 0;
+    for (const mod of modifiers) {
+      if (mod === 'Alt') modifierFlags |= 1;
+      if (mod === 'Ctrl' || mod === 'Control') modifierFlags |= 2;
+      if (mod === 'Meta') modifierFlags |= 4;
+      if (mod === 'Shift') modifierFlags |= 8;
+    }
+    await this.cdp('Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      key,
+      modifiers: modifierFlags,
+    });
+    await this.cdp('Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      key,
+      modifiers: modifierFlags,
+    });
   }
 }
 

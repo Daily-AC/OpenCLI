@@ -73,6 +73,8 @@ export interface IPage {
   goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number }): Promise<void>;
   evaluate<T = any>(js: string): Promise<T>;
   evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
+  /** Execute a write without replaying page code after navigation; throws on an unknown outcome. */
+  evaluateOnce?<T = any>(js: string): Promise<T>;
   /** Safely evaluate JS with pre-serialized arguments — prevents injection. */
   evaluateWithArgs?(js: string, args: Record<string, unknown>): Promise<any>;
   /**
@@ -83,7 +85,7 @@ export interface IPage {
   fetchJson(url: string, opts?: FetchJsonOptions): Promise<unknown>;
   getCookies(opts?: { domain?: string; url?: string }): Promise<BrowserCookie[]>;
   snapshot(opts?: SnapshotOptions): Promise<any>;
-  click(ref: string, opts?: { nth?: number; firstOnMulti?: boolean }): Promise<{ matches_n: number; match_level: 'exact' | 'stable' | 'reidentified' }>;
+  click(ref: string, opts?: { nth?: number; firstOnMulti?: boolean }): Promise<{ matches_n: number; match_level: 'exact' | 'stable' | 'reidentified'; click_method?: 'cdp' | 'js' | 'ax'; hit?: 'target' | 'ancestor' | 'other' | 'none'; retargeted?: boolean }>;
   dblClick?(ref: string, opts?: { nth?: number; firstOnMulti?: boolean }): Promise<{ matches_n: number; match_level: 'exact' | 'stable' | 'reidentified' }>;
   hover?(ref: string, opts?: { nth?: number; firstOnMulti?: boolean }): Promise<{ matches_n: number; match_level: 'exact' | 'stable' | 'reidentified' }>;
   focus?(ref: string, opts?: { nth?: number; firstOnMulti?: boolean }): Promise<{ focused: boolean; matches_n: number; match_level: 'exact' | 'stable' | 'reidentified' }>;
@@ -105,6 +107,8 @@ export interface IPage {
   scrollTo(ref: string, opts?: { nth?: number; firstOnMulti?: boolean }): Promise<any>;
   getFormState(): Promise<any>;
   wait(options: number | WaitOptions): Promise<void>;
+  /** Pure client-side sleep (bare setTimeout, no page evaluation). */
+  sleep(seconds: number): Promise<void>;
   waitForDownload?(pattern?: string, timeoutMs?: number): Promise<BrowserDownloadWaitResult>;
   tabs(): Promise<any>;
   closeTab?(target?: number | string): Promise<void>;
@@ -120,7 +124,7 @@ export interface IPage {
   screenshot(options?: ScreenshotOptions): Promise<string>;
   annotatedScreenshot?(options?: ScreenshotOptions): Promise<string>;
   startNetworkCapture?(pattern?: string): Promise<boolean>;
-  readNetworkCapture?(): Promise<unknown[]>;
+  readNetworkCapture?(options?: { retainIncomplete?: boolean }): Promise<unknown[]>;
   /**
    * Set local file paths on a file input element via CDP DOM.setFileInputFiles.
    * Chrome reads the files directly — no base64 encoding or payload size limits.

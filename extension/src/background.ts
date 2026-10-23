@@ -7,6 +7,7 @@
 
 declare const __OPENCLI_COMPAT_RANGE__: string;
 
+import { callChrome, describeChrome, ChromeApiError } from './chrome-api';
 import type { Command, Result } from './protocol';
 import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL } from './protocol';
 import * as executor from './cdp';
@@ -20,6 +21,19 @@ const CONTEXT_ID_KEY = 'opencli_context_id_v1';
 let currentContextId = 'default';
 let contextIdPromise: Promise<string> | null = null;
 let connectInFlight: Promise<void> | null = null;
+// Startup readiness gate. A MV3 service worker can be woken by an event
+// (alarm, window/tab removal) before initialize()'s recovery chain has
+// rehydrated in-memory lease/container state from storage. Event handlers that
+// persist state must `await workerReady` first, or an empty snapshot overwrites
+// the persisted registry (wiping self-heal pointers and lease records).
+// initialize() replaces this with the real recovery promise; it always
+// resolves (never rejects) so gated handlers can never wedge permanently.
+let workerReady: Promise<void> = Promise.resolve();
+// Synchronous mirror of workerReady's settled state. Lets connect() skip the
+// `await workerReady` microtask hop once recovery is done, so the steady-state
+// (post-recovery) connect path is byte-for-byte the original — only the
+// pre-recovery wake is gated.
+let workerRecovered = true;
 
 async function getCurrentContextId(): Promise<string> {
   if (contextIdPromise) return contextIdPromise;
@@ -108,7 +122,14 @@ function isDaemonSocketActive(socket: WebSocket | null | undefined = ws): boolea
 function connect(): Promise<void> {
   if (isDaemonSocketActive()) return Promise.resolve();
   if (connectInFlight) return connectInFlight;
-  connectInFlight = connectAttempt().finally(() => {
+  // Gate on startup recovery so a keepalive/reconnect wake never opens the
+  // socket into an un-rehydrated worker (daemon commands would then run against
+  // empty lease state). Once recovered, skip straight to connectAttempt so the
+  // steady-state path adds no extra tick. connectInFlight is set synchronously
+  // either way, so concurrent callers still coalesce; workerReady excludes
+  // connect itself, so no deadlock.
+  const attempt = workerRecovered ? connectAttempt() : workerReady.then(() => connectAttempt());
+  connectInFlight = attempt.finally(() => {
     connectInFlight = null;
   });
   return connectInFlight;
@@ -118,14 +139,24 @@ async function connectAttempt(): Promise<void> {
   if (isDaemonSocketActive()) return;
 
   try {
-    const res = await fetch(DAEMON_PING_URL, { signal: AbortSignal.timeout(1000) });
+    // omit credentials so the browser doesn't attach the localhost cookie jar —
+    // a large jar can push the request past Node's default header limit and make
+    // the daemon answer 431, silently wedging the connect loop forever.
+    const res = await fetch(DAEMON_PING_URL, {
+      signal: AbortSignal.timeout(1000),
+      credentials: 'omit',
+    });
     if (!res.ok) {
+      console.warn(`[opencli] daemon ping failed: HTTP ${res.status}`);
       scheduleReconnect();
       return; // unexpected response — not our daemon, but keep polling.
     }
     // Daemon is reachable — proceed straight to the WebSocket below.
     reconnectAttempts = 0;
   } catch {
+    // Daemon not running is the expected idle state — keep the probe silent to
+    // avoid per-poll service-worker noise (see connect() docstring). The 431
+    // wedge this fixes is surfaced in the !res.ok branch above.
     scheduleReconnect();
     return; // daemon not running — keep polling until the next daemon spawn.
   }
@@ -298,15 +329,39 @@ const ownedContainers: Record<OwnedWindowRole, {
   automation: { windowId: null, groupId: null, promise: null, groupPromise: null },
 };
 
+// Ledger of every interactive group id we have created or adopted in the
+// CURRENT browser session, kept so an orphan group (created by
+// `chrome.tabs.group` but never titled because the worker died before the
+// `tabGroups.update`) stays discoverable even when the cached `groupId` and
+// lease layers can't see it. Interactive-only: adapter automation never
+// creates a visible group. Persisted as part of the session registry (see
+// StoredRegistry) and restored by reconcileTargetLeaseRegistry().
+const interactiveGroupLedger = new Set<number>();
+
 type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> & {
   idleDeadlineAt: number;
   updatedAt: number;
 };
 
+// The registry lives in chrome.storage.session, never chrome.storage.local:
+// every id it carries (window, tab, group) is a Chrome runtime number that is
+// only valid within one browser session. Persisting them across a browser
+// restart never enabled real recovery — a recycled id could instead collide
+// with a user-created window/tab/group and let the restore path claim it.
+// storage.session survives MV3 service-worker restarts (the case recovery
+// exists for) and is cleared exactly when the ids die. initialize() also
+// best-effort removes the legacy storage.local copy older versions wrote.
+// Boundary: storage.session is also cleared on extension disable/reload/update
+// and on browser restart — recovery is only promised across service-worker
+// restarts within one browser session. Old leases are NOT recovered after an
+// extension reload/update, and no durable-id logic should be added for that.
 type StoredRegistry = {
   version: 2;
   contextId: BrowserContextId;
-  ownedContainers: Record<OwnedWindowRole, { windowId: number | null; groupId?: number | null }>;
+  ownedContainers: {
+    interactive: { windowId: number | null; groupIds: number[] };
+    automation: { windowId: number | null };
+  };
   leases: Record<string, StoredLease>;
 };
 
@@ -335,6 +390,8 @@ function setSessionOverride(key: string, patch: SessionOverrides): void {
 
 /** Commands currently executing per lease — idle release is deferred while > 0. */
 const activeCommandCounts = new Map<string, number>();
+const closingLeases = new Set<string>();
+const closingTabs = new Set<number>();
 const LEASE_KEY_SEPARATOR = '\u0000';
 
 function getLeaseKey(session: string, surface: BrowserSurface): string {
@@ -440,12 +497,9 @@ function emptyRegistry(): StoredRegistry {
     ownedContainers: {
       interactive: {
         windowId: ownedContainers.interactive.windowId,
-        groupId: ownedContainers.interactive.groupId,
+        groupIds: [...interactiveGroupLedger],
       },
-      automation: {
-        windowId: ownedContainers.automation.windowId,
-        groupId: null,
-      },
+      automation: { windowId: ownedContainers.automation.windowId },
     },
     leases: {},
   };
@@ -453,9 +507,9 @@ function emptyRegistry(): StoredRegistry {
 
 async function readRegistry(): Promise<StoredRegistry> {
   try {
-    const local = chrome.storage?.local;
-    if (!local) return emptyRegistry();
-    const raw = await local.get(REGISTRY_KEY) as Record<string, unknown>;
+    const session = chrome.storage?.session;
+    if (!session) return emptyRegistry(); // no session storage — degrade to memory-only
+    const raw = await session.get(REGISTRY_KEY) as Record<string, unknown>;
     const stored = raw[REGISTRY_KEY] as Partial<StoredRegistry> | undefined;
     if (!stored || stored.version !== 2 || typeof stored.leases !== 'object') return emptyRegistry();
     const storedContainers = stored.ownedContainers && typeof stored.ownedContainers === 'object'
@@ -467,11 +521,12 @@ async function readRegistry(): Promise<StoredRegistry> {
       ownedContainers: {
         interactive: {
           windowId: typeof storedContainers.interactive?.windowId === 'number' ? storedContainers.interactive.windowId : null,
-          groupId: typeof storedContainers.interactive?.groupId === 'number' ? storedContainers.interactive.groupId : null,
+          groupIds: Array.isArray(storedContainers.interactive?.groupIds)
+            ? storedContainers.interactive.groupIds.filter((id): id is number => typeof id === 'number')
+            : [],
         },
         automation: {
           windowId: typeof storedContainers.automation?.windowId === 'number' ? storedContainers.automation.windowId : null,
-          groupId: null,
         },
       },
       leases: stored.leases as Record<string, StoredLease>,
@@ -483,7 +538,7 @@ async function readRegistry(): Promise<StoredRegistry> {
 
 async function writeRegistry(registry: StoredRegistry): Promise<void> {
   try {
-    await chrome.storage?.local?.set({ [REGISTRY_KEY]: registry });
+    await chrome.storage?.session?.set({ [REGISTRY_KEY]: registry });
   } catch {
     // Registry persistence is a recovery aid; command execution should not fail on storage errors.
   }
@@ -513,12 +568,9 @@ async function persistRuntimeState(): Promise<void> {
     ownedContainers: {
       interactive: {
         windowId: ownedContainers.interactive.windowId,
-        groupId: ownedContainers.interactive.groupId,
+        groupIds: [...interactiveGroupLedger],
       },
-      automation: {
-        windowId: ownedContainers.automation.windowId,
-        groupId: null,
-      },
+      automation: { windowId: ownedContainers.automation.windowId },
     },
     leases,
   });
@@ -587,10 +639,6 @@ function resetWindowIdleTimer(leaseKey: string, remainingMs?: number): void {
   }, interval);
 }
 
-function getOwnedContainerGroupTitles(role: OwnedWindowRole): string[] {
-  return role === 'automation' ? [] : [CONTAINER_TAB_GROUP_TITLE.interactive];
-}
-
 type OwnedContainerGroup = {
   id: number;
   windowId: number;
@@ -609,20 +657,22 @@ async function focusOwnedWindowIfRequested(windowId: number, mode: WindowMode): 
 }
 
 async function toOwnedContainerGroupCandidate(group: chrome.tabGroups.TabGroup): Promise<OwnedContainerGroupCandidate | null> {
+  let chromeWindow: chrome.windows.Window;
   try {
-    const chromeWindow = await chrome.windows.get(group.windowId);
-    const reusableTabId = await findReusableOwnedContainerTab(group.windowId, group.id);
-    return {
-      id: group.id,
-      windowId: group.windowId,
-      title: group.title,
-      focused: !!chromeWindow.focused,
-      hasReusableTab: reusableTabId !== undefined,
-    };
-  } catch {
-    // Ignore stale browser-session group/window state and keep looking.
-    return null;
+    chromeWindow = await chrome.windows.get(group.windowId);
+  } catch (err) {
+    if (err instanceof Error && classifyExtensionError(err.message) === 'tab_gone') return null;
+    throw err;
   }
+
+  const reusableTabId = await findReusableOwnedContainerTab(group.windowId, group.id);
+  return {
+    id: group.id,
+    windowId: group.windowId,
+    title: group.title,
+    focused: !!chromeWindow.focused,
+    hasReusableTab: reusableTabId !== undefined,
+  };
 }
 
 function selectOwnedContainerGroupCandidate(candidates: OwnedContainerGroupCandidate[]): OwnedContainerGroupCandidate | null {
@@ -635,6 +685,10 @@ function selectOwnedContainerGroupCandidate(candidates: OwnedContainerGroupCandi
   })[0];
 }
 
+function isMissingTabGroupError(err: unknown): boolean {
+  return err instanceof Error && /No group with id|group no longer exists/i.test(err.message);
+}
+
 async function collectOwnedGroupCandidates(role: OwnedWindowRole): Promise<OwnedContainerGroupCandidate[]> {
   if (role === 'automation') return [];
 
@@ -645,26 +699,47 @@ async function collectOwnedGroupCandidates(role: OwnedWindowRole): Promise<Owned
     try {
       const group = await chrome.tabGroups.get(container.groupId);
       groupsById.set(group.id, group);
-    } catch {
+    } catch (err) {
+      if (!isMissingTabGroupError(err)) throw err;
       container.groupId = null;
     }
   }
 
-  for (const title of getOwnedContainerGroupTitles(role)) {
-    const groups = await chrome.tabGroups.query({ title });
-    for (const group of groups) groupsById.set(group.id, group);
+  // Ledger layer: every interactive group id created/adopted this browser
+  // session (role is guaranteed 'interactive' past the early return above).
+  // Catches the untitled orphan that the lease layer misses. A
+  // missing id means the group has been closed or converged away — drop it so
+  // the ledger stays bounded and never resurrects a dead id.
+  let ledgerPruned = false;
+  for (const groupId of [...interactiveGroupLedger]) {
+    if (groupsById.has(groupId)) continue;
+    try {
+      const group = await chrome.tabGroups.get(groupId);
+      groupsById.set(group.id, group);
+    } catch (err) {
+      if (!isMissingTabGroupError(err)) throw err;
+      interactiveGroupLedger.delete(groupId);
+      ledgerPruned = true;
+    }
   }
+  if (ledgerPruned) await persistRuntimeState();
 
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (!session.owned || getOwnedWindowRole(leaseKey) !== role || session.preferredTabId === null) continue;
+    let tab: chrome.tabs.Tab;
     try {
-      const tab = await chrome.tabs.get(session.preferredTabId);
-      const groupId = tab.groupId;
-      if (typeof groupId !== 'number' || groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) continue;
+      tab = await chrome.tabs.get(session.preferredTabId);
+    } catch (err) {
+      if (err instanceof Error && classifyExtensionError(err.message) === 'tab_gone') continue;
+      throw err;
+    }
+    const groupId = tab.groupId;
+    if (typeof groupId !== 'number' || groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) continue;
+    try {
       const group = await chrome.tabGroups.get(groupId);
       groupsById.set(group.id, group);
-    } catch {
-      // Lease tabs and browser-session groups can disappear independently.
+    } catch (err) {
+      if (!isMissingTabGroupError(err)) throw err;
     }
   }
 
@@ -684,18 +759,14 @@ async function collectOwnedGroupCandidates(role: OwnedWindowRole): Promise<Owned
     ownedPreferredTabIds.add(session.preferredTabId);
   }
   if (ownedPreferredTabIds.size > 0) {
-    try {
-      const allGroups = await chrome.tabGroups.query({});
-      for (const group of allGroups) {
-        if (group.title) continue;
-        if (groupsById.has(group.id)) continue;
-        const tabsInGroup = await chrome.tabs.query({ groupId: group.id });
-        if (tabsInGroup.some((tab) => tab.id !== undefined && ownedPreferredTabIds.has(tab.id))) {
-          groupsById.set(group.id, group);
-        }
+    const allGroups = await chrome.tabGroups.query({});
+    for (const group of allGroups) {
+      if (group.title) continue;
+      if (groupsById.has(group.id)) continue;
+      const tabsInGroup = await chrome.tabs.query({ groupId: group.id });
+      if (tabsInGroup.some((tab) => tab.id !== undefined && ownedPreferredTabIds.has(tab.id))) {
+        groupsById.set(group.id, group);
       }
-    } catch {
-      // Transient query failure: convergence proceeds with the other layers.
     }
   }
 
@@ -722,8 +793,8 @@ async function ensureTabsInWindow(tabIds: number[], windowId: number): Promise<n
         await chrome.tabs.move(tabId, { windowId, index: -1 });
         movedIds.push(tabId);
       }
-    } catch {
-      // The caller may be cleaning stale session state. Missing tabs are ignored here.
+    } catch (err) {
+      if (!(err instanceof Error) || classifyExtensionError(err.message) !== 'tab_gone') throw err;
     }
   }
   return movedIds;
@@ -763,7 +834,14 @@ async function attachTabsToOwnedGroup(
 ): Promise<OwnedContainerGroup> {
   if (ids.length === 0) return group;
   await ensureTabsInWindow(ids, group.windowId);
-  const tabs = await Promise.all(ids.map((id) => chrome.tabs.get(id).catch(() => null)));
+  const tabs = await Promise.all(ids.map(async (id) => {
+    try {
+      return await chrome.tabs.get(id);
+    } catch (err) {
+      if (err instanceof Error && classifyExtensionError(err.message) === 'tab_gone') return null;
+      throw err;
+    }
+  }));
   const missing = tabs
     .filter((tab): tab is chrome.tabs.Tab => tab !== null && tab.id !== undefined && tab.groupId !== group.id)
     .map((tab) => tab.id!);
@@ -780,12 +858,14 @@ async function createOwnedGroup(
   if (ids.length === 0) throw new Error(`Cannot create ${role} tab group without tabs`);
   await ensureTabsInWindow(ids, windowId);
   const groupId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId } });
-  // Persist groupId before the title/color update so a worker crash between
-  // the two API calls can self-heal on resume. `ensureCanonicalGroupTitle`
-  // will repair the title on the next ensure cycle if the update never lands;
-  // we must not `tabs.ungroup` on failure or the persisted id dangles.
   ownedContainers[role].groupId = groupId;
   ownedContainers[role].windowId = windowId;
+  // Record in the ledger and persist BEFORE the title/color update lands so a
+  // worker crash between the two API calls can self-heal on resume:
+  // `ensureCanonicalGroupTitle` repairs the title on the next ensure cycle
+  // once the ledger surfaces the untitled orphan. We must not `tabs.ungroup`
+  // on failure or the recorded id dangles.
+  if (role === 'interactive') interactiveGroupLedger.add(groupId);
   await persistRuntimeState();
   const group = await chrome.tabGroups.update(groupId, {
     color: OWNED_TAB_GROUP_COLOR,
@@ -843,6 +923,11 @@ async function ensureOwnedContainerGroupUnlocked(
     if (canonical) {
       ownedContainers[role].windowId = canonical.windowId;
       ownedContainers[role].groupId = canonical.id;
+      // Adopt groups recovered through leases into the session ledger.
+      if (!interactiveGroupLedger.has(canonical.id)) {
+        interactiveGroupLedger.add(canonical.id);
+        await persistRuntimeState();
+      }
     } else {
       ownedContainers[role].groupId = null;
       if (fallbackWindowId === null) ownedContainers[role].windowId = null;
@@ -884,9 +969,18 @@ async function ensureOwnedContainerWindowUnlocked(
 ): Promise<{ windowId: number; initialTabId?: number }> {
   const container = ownedContainers[role];
   if (container.windowId !== null) {
+    const windowId = container.windowId;
     try {
-      await chrome.windows.get(container.windowId);
-      const group = await ensureOwnedContainerGroup(role, container.windowId, []);
+      await chrome.windows.get(windowId);
+    } catch (err) {
+      if (!(err instanceof Error) || classifyExtensionError(err.message) !== 'tab_gone') throw err;
+      console.warn(`[opencli] Owned ${role} window ${windowId} is unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      container.windowId = null;
+      container.groupId = null;
+    }
+
+    if (container.windowId === windowId) {
+      const group = await ensureOwnedContainerGroup(role, windowId, []);
       if (group) {
         await focusOwnedWindowIfRequested(group.windowId, mode);
         const initialTabId = await findReusableOwnedContainerTab(group.windowId, group.id);
@@ -895,22 +989,17 @@ async function ensureOwnedContainerWindowUnlocked(
           initialTabId,
         };
       }
-      await focusOwnedWindowIfRequested(container.windowId, mode);
-      const initialTabId = await findReusableOwnedContainerTab(container.windowId, null);
-      const createdGroup = await ensureOwnedContainerGroup(role, container.windowId, [initialTabId]);
-      if (createdGroup) {
+      if (role === 'interactive') {
+        container.windowId = null;
+        container.groupId = null;
+      } else {
+        await focusOwnedWindowIfRequested(windowId, mode);
+        const initialTabId = await findReusableOwnedContainerTab(windowId, null);
         return {
-          windowId: createdGroup.windowId,
+          windowId,
           initialTabId,
         };
       }
-      return {
-        windowId: container.windowId,
-        initialTabId,
-      };
-    } catch {
-      container.windowId = null;
-      container.groupId = null;
     }
   }
 
@@ -982,27 +1071,20 @@ async function ensureOwnedContainerWindowUnlocked(
 }
 
 async function findReusableOwnedContainerTab(windowId: number, ownedGroupId?: number | null): Promise<number | undefined> {
-  try {
-    const tabs = await chrome.tabs.query({ windowId });
-    // When a canonical owned group lives in a user window (cross-window
-    // convergence can land it there), an http(s) tab outside the group is
-    // user content and must not be reused. Group members and non-http tabs
-    // (about:blank / data: / fresh container) stay eligible. A null group id
-    // means no ownership signal exists, so only non-http placeholders qualify.
-    const reusable = tabs.find(tab =>
-      tab.id !== undefined &&
-      initialTabIsAvailable(tab.id) &&
-      isDebuggableUrl(tab.url) &&
-      (
-        ownedGroupId === undefined ||
-        (ownedGroupId !== null && tab.groupId === ownedGroupId) ||
-        !isSafeNavigationUrl(tab.url ?? '')
-      ),
-    );
-    return reusable?.id;
-  } catch {
-    return undefined;
-  }
+  const tabs = await chrome.tabs.query({ windowId });
+  // Group members and non-http placeholders stay eligible. Without a group
+  // signal, only non-http placeholders can be reused.
+  const reusable = tabs.find(tab =>
+    tab.id !== undefined &&
+    initialTabIsAvailable(tab.id) &&
+    isDebuggableUrl(tab.url) &&
+    (
+      ownedGroupId === undefined ||
+      (ownedGroupId !== null && tab.groupId === ownedGroupId) ||
+      !isSafeNavigationUrl(tab.url ?? '')
+    ),
+  );
+  return reusable?.id;
 }
 
 function initialTabIsAvailable(tabId: number | undefined): tabId is number {
@@ -1020,7 +1102,9 @@ async function createOwnedTabLease(leaseKey: string, initialUrl?: string): Promi
 async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string): Promise<ResolvedTab> {
   const targetUrl = (initialUrl && isSafeNavigationUrl(initialUrl)) ? initialUrl : BLANK_PAGE;
   const role = getOwnedWindowRole(leaseKey);
-  const { windowId, initialTabId } = await ensureOwnedContainerWindow(role, targetUrl, getWindowMode(leaseKey));
+  // Container creation must not start the lease's navigation as well. A slow
+  // initial load can still expose about:blank, causing a duplicate tabs.update.
+  const { windowId, initialTabId } = await ensureOwnedContainerWindow(role, BLANK_PAGE, getWindowMode(leaseKey));
   let tab: chrome.tabs.Tab;
 
   if (initialTabIsAvailable(initialTabId)) {
@@ -1086,6 +1170,9 @@ async function getAutomationWindow(leaseKey: string, initialUrl?: string): Promi
 
 // Clean up when an owned container window is closed
 chrome.windows.onRemoved.addListener(async (windowId) => {
+  // A window-close event can wake the worker before recovery; persisting the
+  // empty pre-recovery snapshot here would wipe the registry.
+  await workerReady;
   for (const container of Object.values(ownedContainers)) {
     if (container.windowId === windowId) {
       container.windowId = null;
@@ -1106,6 +1193,8 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 
 // Evict identity mappings when tabs are closed
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  // Same wake-before-recovery hazard as windows.onRemoved.
+  await workerReady;
   identity.evictTab(tabId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
@@ -1134,11 +1223,32 @@ function initialize(): void {
   } catch {
     // Some focused tests mock only the cdp functions they exercise.
   }
-  void (async () => {
+  // Migration cleanup: older versions persisted the registry in
+  // chrome.storage.local, where its browser-session-scoped ids go stale after
+  // a browser restart (see StoredRegistry). Remove that one legacy key —
+  // nothing else in local — so it can never be trusted again. Fire-and-forget:
+  // nothing reads the local copy anymore, so ordering does not matter.
+  try {
+    void chrome.storage?.local?.remove?.(REGISTRY_KEY)?.catch?.(() => {});
+  } catch {
+    // Best-effort cleanup.
+  }
+  // Rehydrate context + lease/container state before any event handler that
+  // persists is allowed to run (see workerReady). connect() is deliberately
+  // outside this promise — it awaits workerReady on its own, so keeping it out
+  // avoids a self-wait while still ordering the socket after recovery.
+  workerRecovered = false;
+  workerReady = (async () => {
     await getCurrentContextId();
     await reconcileTargetLeaseRegistry();
-    await connect();
-  })();
+  })().catch((err) => {
+    // Never leave workerReady rejected/pending: a wedged gate would freeze
+    // every gated handler for the life of the worker.
+    console.warn(`[opencli] Startup recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+  }).finally(() => {
+    workerRecovered = true;
+  });
+  void workerReady.then(() => connect());
   console.log('[opencli] OpenCLI extension initialized');
 }
 
@@ -1156,6 +1266,9 @@ chrome.runtime.onStartup.addListener(() => {
 initialize();
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  // Idle-lease alarms and keepalive can both fire in a freshly woken worker;
+  // gate on recovery so releaseLease never persists an empty snapshot.
+  await workerReady;
   if (alarm.name === 'keepalive') void connect();
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
@@ -1213,9 +1326,23 @@ async function fetchDaemonVersion(): Promise<string | null> {
 // ─── Command dispatcher ─────────────────────────────────────────────
 
 async function handleCommand(cmd: Command): Promise<Result> {
+  // Native browser resources do not belong to a page session or idle timer.
+  if (cmd.action === 'chrome-describe' || cmd.action === 'chrome-call') {
+    try {
+      if (cmd.action === 'chrome-describe') return { id: cmd.id, ok: true, data: await describeChrome(cmd.chromeMethod) };
+      return await withLeaseMutation(async () => ({ id: cmd.id, ok: true, data: await callChrome(
+        cmd.chromeMethod ?? '', cmd.chromeArgs ?? [],
+        new Set([...automationSessions.values()].map(s => s.preferredTabId).filter((id): id is number => id !== null)),
+        new Set([...interactiveGroupLedger, ...Object.values(ownedContainers).map(c => c.groupId).filter((id): id is number => id !== null)]),
+      ) }));
+    } catch (error) { return errorResult(cmd.id, error); }
+  }
   const session = getSessionName(cmd.session);
   const surface = getCommandSurface(cmd);
   const leaseKey = getLeaseKey(session, surface);
+  if (closingLeases.has(leaseKey)) {
+    return errorResult(cmd.id, new CommandFailure('session_busy', 'This session is closing; retry after cleanup finishes.'));
+  }
   if (cmd.windowMode === 'foreground' || cmd.windowMode === 'background') {
     setSessionOverride(leaseKey, { windowMode: cmd.windowMode });
   }
@@ -1244,6 +1371,7 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleCookies(cmd);
       case 'screenshot':
         return await handleScreenshot(cmd, leaseKey);
+      case 'close-owned-tab':
       case 'close-window':
         return await handleCloseWindow(cmd, leaseKey);
       case 'cdp':
@@ -1356,6 +1484,9 @@ function setLeaseSession(
   leaseKey: string,
   session: Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt' | 'contextId' | 'ownership' | 'lifecycle' | 'windowRole'>,
 ): void {
+  if (session.preferredTabId !== null && closingTabs.has(session.preferredTabId)) {
+    throw new CommandFailure('session_busy', 'This tab is closing; wait for cleanup to finish.');
+  }
   const existing = automationSessions.get(leaseKey);
   if (existing?.idleTimer) clearTimeout(existing.idleTimer);
   const timeout = getIdleTimeout(leaseKey);
@@ -1572,7 +1703,7 @@ function classifyExtensionError(message: string): string | undefined {
 
 function errorResult(id: string, err: unknown): Result {
   const message = err instanceof Error ? err.message : String(err);
-  if (err instanceof CommandFailure) {
+  if (err instanceof CommandFailure || err instanceof ChromeApiError) {
     return { id, ok: false, error: message, errorCode: err.code, ...(err.hint ? { errorHint: err.hint } : {}) };
   }
   const errorCode = classifyExtensionError(message);
@@ -1612,14 +1743,29 @@ async function handleFrames(cmd: Command, leaseKey: string): Promise<Result> {
   }
 }
 
+function preferOwnedTab(leaseKey: string, tabId: number): void {
+  const session = automationSessions.get(leaseKey);
+  if (!session?.owned) return;
+  setLeaseSession(leaseKey, {
+    session: session.session,
+    surface: session.surface,
+    kind: session.kind,
+    windowId: session.windowId,
+    owned: true,
+    preferredTabId: tabId,
+  });
+}
+
 async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   if (!cmd.url) return { id: cmd.id, ok: false, error: 'Missing url' };
   if (!isSafeNavigationUrl(cmd.url)) {
     return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
   }
-  // Pass target URL so that first-time window creation can start on the right domain
+  // Acquire a blank lease first: this handler alone starts the navigation.
+  // Passing cmd.url into lease creation issues the same request twice while
+  // the first load is pending, which Chromium can reject (#2487).
   const cmdTabId = await resolveCommandTabId(cmd);
-  const resolved = await resolveTab(cmdTabId, leaseKey, cmd.url);
+  const resolved = await resolveTab(cmdTabId, leaseKey);
   const tabId = resolved.tabId;
 
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
@@ -1774,6 +1920,34 @@ async function handleTabs(cmd: Command, leaseKey: string): Promise<Result> {
         }
         return { id: cmd.id, ok: true, data: { closed: closedPage } };
       }
+      if (cmd.page !== undefined && session?.owned) {
+        let tabId: number | undefined;
+        try {
+          tabId = await resolveCommandTabId(cmd);
+        } catch {
+          return { id: cmd.id, ok: false, error: `Page no longer exists` };
+        }
+        if (tabId === undefined) {
+          return { id: cmd.id, ok: false, error: `Page no longer exists` };
+        }
+        let tab: chrome.tabs.Tab;
+        try {
+          tab = await chrome.tabs.get(tabId);
+        } catch {
+          return { id: cmd.id, ok: false, error: `Page no longer exists` };
+        }
+        if (tab.windowId !== session.windowId) {
+          return { id: cmd.id, ok: false, error: `Page is not in the automation container` };
+        }
+        const closedPage = await identity.resolveTargetId(tabId).catch(() => undefined);
+        if (session.preferredTabId === tabId) {
+          await releaseLease(leaseKey, 'tab close');
+        } else {
+          await safeDetach(tabId);
+          await chrome.tabs.remove(tabId);
+        }
+        return { id: cmd.id, ok: true, data: { closed: closedPage } };
+      }
       const cmdTabId = await resolveCommandTabId(cmd);
       const tabId = await resolveTabId(cmdTabId, leaseKey);
       const closedPage = await identity.resolveTargetId(tabId).catch(() => undefined);
@@ -1802,12 +1976,14 @@ async function handleTabs(cmd: Command, leaseKey: string): Promise<Result> {
           return { id: cmd.id, ok: false, error: `Page is not in the automation container` };
         }
         await chrome.tabs.update(cmdTabId, { active: true });
+        preferOwnedTab(leaseKey, cmdTabId);
         return pageScopedResult(cmd.id, cmdTabId, { selected: true });
       }
       const tabs = await listAutomationWebTabs(leaseKey);
       const target = tabs[cmd.index!];
       if (!target?.id) return { id: cmd.id, ok: false, error: `Tab index ${cmd.index} not found` };
       await chrome.tabs.update(target.id, { active: true });
+      preferOwnedTab(leaseKey, target.id);
       return pageScopedResult(cmd.id, target.id, { selected: true });
     }
     default:
@@ -1918,6 +2094,47 @@ function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFr
 }
 
 async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result> {
+  if (cmd.action === 'close-owned-tab') {
+    return withLeaseMutation(async () => {
+      if ((activeCommandCounts.get(leaseKey) ?? 0) > 1) {
+        throw new CommandFailure('session_busy', 'Cannot close a tab while another command is using this session.');
+      }
+      closingLeases.add(leaseKey);
+      let closingTabId: number | undefined;
+      try {
+        const session = automationSessions.get(leaseKey);
+        if (!session?.owned) {
+          await releaseLease(leaseKey, 'explicit close');
+          return { id: cmd.id, ok: true, data: { closed: true, session: getSessionFromKey(leaseKey), tabCleanup: 'no-owned-tab' } };
+        }
+        const tabId = session.preferredTabId;
+        if (tabId === null) {
+          throw new CommandFailure('owned_tab_identity_missing', 'Cannot close an owned lease without a tab identity.');
+        }
+        if ([...automationSessions.entries()].some(([key, lease]) => key !== leaseKey && lease.preferredTabId === tabId)) {
+          throw new CommandFailure('session_busy', 'Another session also uses this tab; release that session before closing it.');
+        }
+        closingTabId = tabId;
+        closingTabs.add(tabId);
+        // Only touch the lease's tab, even if the user added pages to its window.
+        // Ungroup first so Chrome does not save the closing automation group.
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.groupId !== undefined && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+          await chrome.tabs.ungroup(tabId);
+        }
+        await safeDetach(tabId);
+        // Do not evict identity or forget ownership if Chrome rejects removal:
+        // the caller must be able to retry cleanup without repeating the site action.
+        await chrome.tabs.remove(tabId);
+        identity.evictTab(tabId);
+        await removeLeaseSession(leaseKey);
+        return { id: cmd.id, ok: true, data: { closed: true, session: session.session, tabCleanup: 'closed-owned-tab' } };
+      } finally {
+        closingLeases.delete(leaseKey);
+        if (closingTabId !== undefined) closingTabs.delete(closingTabId);
+      }
+    });
+  }
   const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
   await releaseLease(leaseKey, 'explicit close');
   return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
@@ -1966,7 +2183,7 @@ async function handleNetworkCaptureRead(cmd: Command, leaseKey: string): Promise
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const data = await executor.readNetworkCapture(tabId);
+    const data = await executor.readNetworkCapture(tabId, cmd.retainIncomplete === true);
     return pageScopedResult(cmd.id, tabId, data);
   } catch (err) {
     return errorResult(cmd.id, err);
@@ -2035,16 +2252,20 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
 
 async function reconcileTargetLeaseRegistry(): Promise<void> {
   const registry = await readRegistry();
+  // Restore the orphan-group ledger (readRegistry already coerced it to a
+  // clean number[]).
+  interactiveGroupLedger.clear();
+  for (const id of registry.ownedContainers.interactive.groupIds) interactiveGroupLedger.add(id);
+  // Restore container window ids; group ownership is re-established from the
+  // browser-session ledger and owned lease tabs during convergence.
   for (const role of Object.keys(ownedContainers) as OwnedWindowRole[]) {
     ownedContainers[role].windowId = registry.ownedContainers[role]?.windowId ?? null;
-    ownedContainers[role].groupId = registry.ownedContainers[role]?.groupId ?? null;
     const windowId = ownedContainers[role].windowId;
     if (windowId !== null) {
       try {
         await chrome.windows.get(windowId);
       } catch {
         ownedContainers[role].windowId = null;
-        ownedContainers[role].groupId = null;
       }
     }
   }
@@ -2096,6 +2317,17 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
       // Registry is semantic state, not truth. If Chrome no longer has the tab,
       // drop the lease record and never close unrelated user resources.
     }
+  }
+
+  // Converge the interactive owned group on startup: adopt/title an orphan the
+  // ledger surfaces, or clear a dangling groupId when none survives. Runs even
+  // with no leases so orphans left by a mid-create crash get repaired instead
+  // of accumulating as untitled "OpenCLI Browser" duplicates (#2097). Best
+  // effort — reconcile must still persist restored leases if this fails.
+  try {
+    await ensureOwnedContainerGroup('interactive', null, []);
+  } catch (err) {
+    console.warn(`[opencli] Startup interactive group convergence failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   await persistRuntimeState();
@@ -2158,6 +2390,11 @@ export const __test__ = {
   sessionOverrides,
   reconcileTargetLeaseRegistry,
   ensureOwnedContainerGroup,
+  getInteractiveContainer: () => ({
+    windowId: ownedContainers.interactive.windowId,
+    groupId: ownedContainers.interactive.groupId,
+    groupIds: [...interactiveGroupLedger],
+  }),
   connectForTest: connect,
   scheduleReconnectForTest: () => scheduleReconnect(),
   getReconnectAttempts: () => reconnectAttempts,

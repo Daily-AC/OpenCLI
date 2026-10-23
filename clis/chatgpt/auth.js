@@ -1,18 +1,7 @@
 import { AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
 import { registerSiteAuthCommands } from '../_shared/site-auth.js';
 
-async function hasChatgptSessionCookie(page) {
-  const cookies = await page.getCookies({ url: 'https://chatgpt.com' });
-  return cookies.some(c => c.name === '__Secure-next-auth.session-token' && c.value);
-}
-
-async function verifyChatgptIdentity(page) {
-  if (!await hasChatgptSessionCookie(page)) {
-    throw new AuthRequiredError('chatgpt.com', 'ChatGPT __Secure-next-auth.session-token cookie missing');
-  }
-  await page.goto('https://chatgpt.com/');
-  await page.wait(2);
-  const result = await page.evaluate(`(async () => {
+const WHOAMI_PROBE = `(async () => {
     try {
       const res = await fetch('/api/auth/session', { credentials: 'include' });
       if (res.status === 401 || res.status === 403) {
@@ -28,7 +17,10 @@ async function verifyChatgptIdentity(page) {
     } catch (e) {
       return { kind: 'exception', detail: String(e && e.message || e) };
     }
-  })()`);
+  })()`;
+
+async function probeChatgptIdentity(page) {
+  const result = await page.evaluate(WHOAMI_PROBE);
   if (result?.kind === 'auth') throw new AuthRequiredError('chatgpt.com', result.detail);
   if (result?.kind === 'http') throw new CommandExecutionError(`HTTP ${result.httpStatus} from /api/auth/session`);
   if (result?.kind === 'exception') throw new CommandExecutionError(`ChatGPT whoami failed: ${result.detail}`);
@@ -41,12 +33,14 @@ registerSiteAuthCommands({
   domain: 'chatgpt.com',
   loginUrl: 'https://auth.openai.com/log-in',
   columns: ['user_id', 'name'],
-  quickCheck: hasChatgptSessionCookie,
-  verify: verifyChatgptIdentity,
+  verify: async (page) => {
+    await page.goto('https://chatgpt.com/');
+    await page.wait(2);
+    return probeChatgptIdentity(page);
+  },
   poll: async (page) => {
-    if (!await hasChatgptSessionCookie(page)) {
-      throw new AuthRequiredError('chatgpt.com', 'Waiting for ChatGPT session cookie');
-    }
-    return verifyChatgptIdentity(page);
+    const host = await page.evaluate('location.hostname');
+    if (host !== 'chatgpt.com') throw new AuthRequiredError('chatgpt.com', 'Waiting for ChatGPT sign-in to return');
+    return probeChatgptIdentity(page);
   },
 });

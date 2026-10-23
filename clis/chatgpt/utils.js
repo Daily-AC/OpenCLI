@@ -43,6 +43,14 @@ const CHATGPT_MODEL_TARGETS = {
         intelligenceOrder: 3,
         aliases: ['ultra', 'xhigh', 'x-high', 'extra-high', '超高'],
     },
+    'gpt-5.6-pro': {
+        label: 'GPT-5.6 Pro',
+        labels: ['GPT-5.6 Pro', 'GPT-5.6 Sol Pro', 'GPT-5.6 专业', 'GPT-5.6 Sol 专业'],
+        optionLabels: ['GPT-5.6 Pro', 'GPT-5.6 Sol Pro', 'GPT-5.6 专业', 'GPT-5.6 Sol 专业'],
+        testIds: ['model-switcher-gpt-5-6-pro'],
+        aliases: ['gpt-5-6-pro', 'gpt-5.6-sol-pro', 'gpt-5-6-sol-pro', 'gpt-5.6', 'gpt-5-6', '5.6-pro', '5.6'],
+        modelConfig: { modelSlug: 'gpt-5-6-pro', effort: 'standard' },
+    },
     pro: {
         label: 'Pro',
         labels: ['Pro', 'Professional', '进阶专业', '专业'],
@@ -73,6 +81,8 @@ export const CHATGPT_TOOL_CHOICES = Object.keys(CHATGPT_TOOL_OPTIONS);
 
 // Selectors
 const COMPOSER_SELECTORS = [
+    'form[data-chatgpt-composer] .ProseMirror[contenteditable="true"]',
+    'form[data-composer-placement="thread"] .ProseMirror[contenteditable="true"]',
     '[contenteditable="true"][role="textbox"]',
     '#prompt-textarea[contenteditable="true"]',
     '[aria-label="Chat with ChatGPT"]',
@@ -110,9 +120,12 @@ function buildComposerLocatorScript() {
     const markerAttr = 'data-opencli-chatgpt-composer';
     return `
       const isVisible = (el) => {
-        if (!(el instanceof HTMLElement)) return false;
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (!(el instanceof HTMLElement) || el.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+        for (let node = el; node; node = node.parentElement) {
+          const style = window.getComputedStyle(node);
+          if (style.display === 'none' || style.visibility === 'hidden' ||
+              (style.opacity !== '' && Number(style.opacity) < 0.01)) return false;
+        }
         const rect = el.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
       };
@@ -127,6 +140,7 @@ function buildComposerLocatorScript() {
       const findComposer = () => {
         for (const selector of ${JSON.stringify(COMPOSER_SELECTORS)}) {
           const candidates = Array.from(document.querySelectorAll(selector)).filter(c => c instanceof HTMLElement && isVisible(c));
+          if (candidates.length > 1) return null;
           const node = candidates.find(c => c.isContentEditable) || candidates[0];
           if (node instanceof HTMLElement) {
             clearMarkers(node);
@@ -288,9 +302,26 @@ const CONVERSATION_LINK_SELECTOR = 'a[href*="/c/"]';
 const PROJECT_LINK_SELECTOR = 'a[href*="/g/g-p-"]';
 // Selector used by detail.js to wait for at least one rendered message bubble
 // after navigating to /c/<id>; mirrors the markup queried by getVisibleMessages.
-export const CONVERSATION_MESSAGE_SELECTOR = '[data-message-author-role], article[data-testid*="conversation-turn"]';
+// 2026-10 redesign: turns are [data-chatgpt-search-unit-key="…:user|:assistant"].
+export const CONVERSATION_MESSAGE_SELECTOR = '[data-message-author-role], article[data-testid*="conversation-turn"], [data-chatgpt-search-unit-key]';
+
+async function activateChatGPTSessionTab(page) {
+    if (typeof page.tabs !== 'function' || typeof page.selectTab !== 'function') return;
+    const tabs = await page.tabs();
+    const candidates = Array.isArray(tabs) ? tabs.filter((tab) => {
+        try { return isTrustedChatGPTHost(new URL(tab.url).hostname); }
+        catch { return false; }
+    }) : [];
+    const targetId = page.getActivePage?.();
+    const target = candidates.find((tab) => tab.page === targetId)
+        ?? (candidates.length === 1 ? candidates[0] : null);
+    if (target?.active === false && typeof target.page === 'string') {
+        await page.selectTab(target.page);
+    }
+}
 
 export async function ensureOnChatGPT(page) {
+    await activateChatGPTSessionTab(page);
     if (await isOnChatGPT(page)) return false;
     await page.goto(CHATGPT_URL, { settleMs: 2000 });
     try {
@@ -302,6 +333,7 @@ export async function ensureOnChatGPT(page) {
 }
 
 export async function startNewChat(page) {
+    await activateChatGPTSessionTab(page);
     await page.goto(`${CHATGPT_URL}/new`, { settleMs: 2000 });
     try {
         await page.wait({ selector: COMPOSER_WAIT_SELECTOR, timeout: 8 });
@@ -392,6 +424,30 @@ function requireKnownChatGPTTool(tool) {
     return { key, ...option };
 }
 
+const REASONING_CONTROLS_JS = `
+    const reasoningVisible = (element) => {
+        if (!(element instanceof HTMLElement) || element.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        for (let node = element; node; node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden' ||
+                (style.opacity !== '' && Number(style.opacity) < 0.01)) return false;
+        }
+        return true;
+    };
+    const reasoningMatches = (selector) => Array.from(document.querySelectorAll(selector)).filter(reasoningVisible);
+`;
+const FOCUS_REASONING_SLIDER_JS = `(() => {
+    ${REASONING_CONTROLS_JS}
+    const rows = reasoningMatches('[data-reasoning-slider="true"]');
+    if (rows.length !== 1) return false;
+    const row = rows[0];
+    if (!row.querySelector('[role="slider"]') || row.getAttribute('aria-disabled') === 'true') return false;
+    row.focus();
+    return document.activeElement === row;
+})()`;
+
 export async function getCurrentChatGPTModel(page) {
     return requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
         const isVisible = (el) => {
@@ -414,6 +470,14 @@ export async function getCurrentChatGPTModel(page) {
             return normalizedText.replace(/\\s+/g, '').includes(normalizedLabel.replace(/\\s+/g, ''));
         };
         const labels = ${JSON.stringify(CHATGPT_MODEL_TARGETS)};
+        ${REASONING_CONTROLS_JS}
+        const effortTriggers = reasoningMatches('button[data-selected-reasoning-effort]');
+        if (effortTriggers.length > 1) return { model: null, label: '', ambiguousReasoning: true };
+        const effortTrigger = effortTriggers[0];
+        if (effortTrigger instanceof HTMLElement && isVisible(effortTrigger)) {
+            const effortKey = { low: 'fast', medium: 'balanced', high: 'advanced', xhigh: 'very-high' }[effortTrigger.getAttribute('data-selected-reasoning-effort')];
+            if (effortKey) return { model: effortKey, label: labels[effortKey].label };
+        }
         const findEntryForText = (text) => {
             const matches = [];
             for (const [key, value] of Object.entries(labels)) {
@@ -550,6 +614,58 @@ async function setChatGPTModelConfig(page, target) {
     return { ok: true, status: response.status, modelSlug, effort };
 }
 
+async function selectModernChatGPTIntelligence(page, target) {
+    const desiredEffort = { fast: 'low', balanced: 'medium', advanced: 'high', 'very-high': 'xhigh' }[target.key];
+    if (!desiredEffort) return false;
+    const trigger = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        ${REASONING_CONTROLS_JS}
+        const buttons = reasoningMatches('button[data-selected-reasoning-effort]');
+        if (buttons.length > 1) return { ambiguous: true };
+        const button = buttons[0];
+        if (!button) return { found: false };
+        if (button.disabled || button.getAttribute('aria-disabled') === 'true') return { disabled: true };
+        const rect = button.getBoundingClientRect();
+        if (!rect.width || !rect.height) return { found: false };
+        return { found: true, open: button.getAttribute('aria-expanded') === 'true', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    })()`)), 'chatgpt reasoning trigger');
+    if (trigger.ambiguous || trigger.disabled) {
+        throw new CommandExecutionError('ChatGPT reasoning control is ambiguous or disabled.');
+    }
+    if (!trigger.found) return false;
+    if (typeof page.nativeKeyPress !== 'function' || (!trigger.open && typeof page.nativeClick !== 'function')) {
+        throw new CommandExecutionError('ChatGPT reasoning selection requires native browser keyboard support.');
+    }
+    if (!trigger.open) await page.nativeClick(trigger.x, trigger.y);
+    await page.wait(0.5);
+    try {
+        let focused = false;
+        for (let attempt = 0; attempt < 6 && !focused; attempt += 1) {
+            focused = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(FOCUS_REASONING_SLIDER_JS)), 'chatgpt reasoning slider focus');
+            if (!focused) await page.wait({ time: 0.25 });
+        }
+        if (!focused) throw new CommandExecutionError('Could not focus the ChatGPT reasoning slider.');
+        const order = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+        for (let attempt = 0; attempt < order.length; attempt += 1) {
+            const effort = unwrapEvaluateResult(await page.evaluate(`(() => {
+                ${REASONING_CONTROLS_JS}
+                const buttons = reasoningMatches('button[data-selected-reasoning-effort]');
+                return buttons.length === 1 ? buttons[0].getAttribute('data-selected-reasoning-effort') : null;
+            })()`));
+            if (effort === desiredEffort) return true;
+            const currentIndex = order.indexOf(effort);
+            if (currentIndex < 0) throw new CommandExecutionError('ChatGPT returned an unknown reasoning effort.');
+            if (!requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(FOCUS_REASONING_SLIDER_JS)), 'chatgpt reasoning slider focus')) {
+                throw new CommandExecutionError('ChatGPT reasoning slider lost its unique focus target.');
+            }
+            await page.nativeKeyPress(currentIndex < order.indexOf(desiredEffort) ? 'ArrowRight' : 'ArrowLeft');
+            await page.wait(0.2);
+        }
+        throw new CommandExecutionError(`ChatGPT reasoning effort did not switch to ${target.label}.`);
+    } finally {
+        await page.nativeKeyPress('Escape');
+    }
+}
+
 export async function selectChatGPTModel(page, model) {
     const target = requireKnownChatGPTModel(model);
     debugChatGPTModel(`target=${target.key}`);
@@ -569,8 +685,14 @@ export async function selectChatGPTModel(page, model) {
 
     const before = await getCurrentChatGPTModel(page);
     debugChatGPTModel(`before=${before.model || 'none'}`);
+    if (before.ambiguousReasoning) {
+        throw new CommandExecutionError('ChatGPT reasoning control is ambiguous.');
+    }
     if (before.model === target.key) {
         return { Status: 'Already selected', Model: target.label };
+    }
+    if (await selectModernChatGPTIntelligence(page, target)) {
+        return { Status: 'Success', Model: target.label };
     }
     const apiResult = await setChatGPTModelConfig(page, target);
     debugChatGPTModel(`api=${apiResult ? JSON.stringify({ ok: apiResult.ok, status: apiResult.status, reason: apiResult.reason }) : 'none'}`);
@@ -764,18 +886,46 @@ export async function getCurrentChatGPTTool(page) {
             const rect = el.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0;
         };
-        const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-        const labels = ${JSON.stringify(CHATGPT_TOOL_OPTIONS)};
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const compact = (value) => normalize(value).toLowerCase().replace(/[^\\p{L}\\p{N}]+/gu, '');
+            const matchesLabel = (value, labels) => {
+                const normalized = normalize(value).toLowerCase();
+                const compacted = compact(value);
+                if (!normalized && !compacted) return false;
+                return labels.some((label) => {
+                    const normalizedLabel = normalize(label).toLowerCase();
+                    const compactedLabel = compact(label);
+                    return normalized === normalizedLabel
+                        || normalized.includes(normalizedLabel)
+                        || (compactedLabel && compacted.includes(compactedLabel));
+                });
+            };
+            const labels = ${JSON.stringify(CHATGPT_TOOL_OPTIONS)};
         const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
         const root = form || document.body;
-        const nodes = Array.from(root.querySelectorAll('button, [role="button"], [role="menuitemradio"], span, div'));
+        const nodes = Array.from(root.querySelectorAll('button, [role="button"], [role="menuitemradio"], [role="menuitem"], [role="option"], span, div[tabindex="0"], div'));
         const node = nodes.find((candidate) => {
             if (!isVisible(candidate)) return false;
-            const text = normalize(candidate.textContent);
-            return Object.values(labels).some((entry) => entry.labels.includes(text));
+            const composerSelector = '[contenteditable="true"][role="textbox"], #prompt-textarea[contenteditable="true"], [data-testid="prompt-textarea"][contenteditable="true"]';
+            const toolPill = candidate.closest('[contenteditable="false"]');
+            if (!toolPill && (candidate.closest(composerSelector) || candidate.querySelector(composerSelector))) return false;
+            const haystacks = [
+                candidate.textContent,
+                candidate.getAttribute('aria-label'),
+                candidate.getAttribute('title'),
+                candidate.getAttribute('data-testid'),
+            ];
+            return Object.values(labels).some((entry) => haystacks.some((value) => matchesLabel(value, entry.labels)));
         });
-        const label = normalize(node?.textContent || '');
-        const entry = Object.entries(labels).find(([, value]) => value.labels.includes(label));
+        const haystacks = node instanceof HTMLElement
+            ? [
+                node.textContent,
+                node.getAttribute('aria-label'),
+                node.getAttribute('title'),
+                node.getAttribute('data-testid'),
+            ]
+            : [];
+        const entry = Object.entries(labels).find(([, value]) => haystacks.some((candidate) => matchesLabel(candidate, value.labels)));
         return {
             tool: entry?.[0] ?? null,
             label: entry?.[1]?.label ?? null,
@@ -804,7 +954,7 @@ export async function selectChatGPTTool(page, tool) {
             const rect = el.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0;
         };
-        const button = document.querySelector('button[data-testid="composer-plus-btn"]');
+        const button = document.querySelector('button[data-testid="composer-plus-btn"], button[aria-label="Add files and more"]');
         if (!(button instanceof HTMLElement) || !isVisible(button)) return { found: false };
         button.scrollIntoView({ block: 'center', inline: 'center' });
         const rect = button.getBoundingClientRect();
@@ -831,11 +981,43 @@ export async function selectChatGPTTool(page, tool) {
                 return rect.width > 0 && rect.height > 0;
             };
             const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const compact = (value) => normalize(value).toLowerCase().replace(/[^\\p{L}\\p{N}]+/gu, '');
             const labels = ${JSON.stringify(target.labels)};
-            const options = Array.from(document.querySelectorAll('[role="menuitemradio"]'));
-            const option = options.find((node) => node instanceof HTMLElement && isVisible(node) && labels.includes(normalize(node.textContent)));
+            const optionSelector = '[role="menuitemradio"], [role="menuitem"], [role="option"], button, div[tabindex="0"]';
+            const matchesLabel = (value) => {
+                const normalized = normalize(value).toLowerCase();
+                const compacted = compact(value);
+                if (!normalized && !compacted) return false;
+                return labels.some((label) => {
+                    const normalizedLabel = normalize(label).toLowerCase();
+                    const compactedLabel = compact(label);
+                    return normalized === normalizedLabel
+                        || normalized.includes(normalizedLabel)
+                        || (compactedLabel && compacted.includes(compactedLabel));
+                });
+            };
+            const rootSelector = '[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content], [data-testid*="menu"], [data-testid*="popover"], [data-mention-list-scroll-area]';
+            const visibleRoots = Array.from(document.querySelectorAll(rootSelector))
+                .filter((node) => node instanceof HTMLElement && isVisible(node) && !node.closest('nav, aside'));
+            const searchRoots = visibleRoots.length ? visibleRoots : [document];
+            const options = Array.from(new Set(searchRoots.flatMap((root) => {
+                const matchesRoot = root instanceof HTMLElement && root.matches(optionSelector) ? [root] : [];
+                return matchesRoot.concat(Array.from(root.querySelectorAll(optionSelector)));
+            })));
+            // Prefer a row whose text starts with the label: 'Search' also matches 'Browse and search your files'.
+            const startsWithLabel = (node) => labels.some((label) => normalize(node.textContent).toLowerCase().startsWith(normalize(label).toLowerCase()));
+            const option = options.filter(startsWithLabel).concat(options).find((node) => {
+                if (!(node instanceof HTMLElement) || !isVisible(node) || node.closest('nav, aside')) return false;
+                const haystacks = [
+                    node.textContent,
+                    node.getAttribute('aria-label'),
+                    node.getAttribute('title'),
+                    node.getAttribute('data-testid'),
+                ];
+                return haystacks.some(matchesLabel);
+            });
             if (!(option instanceof HTMLElement)) return { found: false };
-            const checked = option.getAttribute('aria-checked') === 'true';
+            const checked = option.getAttribute('aria-checked') === 'true' || option.getAttribute('aria-selected') === 'true';
             option.scrollIntoView({ block: 'center', inline: 'center' });
             const rect = option.getBoundingClientRect();
             return {
@@ -917,11 +1099,7 @@ export function parseChatGPTProjectId(value) {
     );
 }
 
-/**
- * Send a message to the ChatGPT composer and submit it.
- * Returns true if the message was sent successfully.
- */
-export async function sendChatGPTMessage(page, text) {
+async function closeChatGPTSidebar(page) {
     // Close sidebar if open (it can cover the chat composer)
     await page.evaluate(`
         (() => {
@@ -930,6 +1108,14 @@ export async function sendChatGPTMessage(page, text) {
             if (closeBtn) closeBtn.click();
         })()
     `);
+}
+
+/**
+ * Clear and fill the ChatGPT composer without submitting it.
+ * Returns true if the composer was ready and the text was inserted.
+ */
+async function fillChatGPTMessage(page, text) {
+    await closeChatGPTSidebar(page);
     // The previous 0.5 s + 1.5 s pre-composer settles are dropped: the next
     // page.evaluate roundtrip flushes the close-sidebar React update and
     // findComposer() retries inside a single CDP call, so no fixed sleep is
@@ -944,8 +1130,24 @@ export async function sendChatGPTMessage(page, text) {
             if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
                 composer.value = '';
             } else if (composer.isContentEditable) {
-                composer.textContent = '';
-                composer.innerHTML = '<p><br></p>';
+                const preserved = Array.from(composer.querySelectorAll('[contenteditable="false"]')).map((node) => node.cloneNode(true));
+                if (preserved.length) {
+                    const p = document.createElement('p');
+                    for (const node of preserved) {
+                        p.appendChild(node);
+                        p.appendChild(document.createTextNode(' '));
+                    }
+                    composer.replaceChildren(p);
+                } else {
+                    composer.textContent = '';
+                    composer.innerHTML = '<p><br></p>';
+                }
+                const range = document.createRange();
+                range.selectNodeContents(composer);
+                range.collapse(false);
+                const selection = window.getSelection();
+                selection?.removeAllRanges();
+                selection?.addRange(range);
             } else {
                 composer.textContent = '';
             }
@@ -955,6 +1157,7 @@ export async function sendChatGPTMessage(page, text) {
             const rect = composer.getBoundingClientRect();
             return {
                 ready: true,
+                contentEditable: !!composer.isContentEditable,
                 x: Math.round(rect.left + Math.max(8, Math.min(rect.width / 2, rect.width - 8))),
                 y: Math.round(rect.top + Math.max(8, Math.min(rect.height / 2, rect.height - 8))),
             };
@@ -970,6 +1173,22 @@ export async function sendChatGPTMessage(page, text) {
                 await page.nativeClick(Number(typeResult.x), Number(typeResult.y));
                 await page.wait(0.2);
             }
+            if (typeResult.contentEditable) {
+                await page.evaluate(`
+                    (() => {
+                        ${buildComposerLocatorScript()}
+                        const composer = findComposer();
+                        if (!composer || !composer.isContentEditable) return;
+                        composer.focus();
+                        const range = document.createRange();
+                        range.selectNodeContents(composer);
+                        range.collapse(false);
+                        const selection = window.getSelection();
+                        selection?.removeAllRanges();
+                        selection?.addRange(range);
+                    })()
+                `);
+            }
             await page.nativeType(text);
         } else {
             throw new Error('nativeType unavailable');
@@ -978,9 +1197,8 @@ export async function sendChatGPTMessage(page, text) {
         // Fallback: use execCommand
         await page.evaluate(`
             (() => {
-                var composer = null;
-                var sels = ${JSON.stringify(COMPOSER_SELECTORS)};
-                for (var si = 0; si < sels.length; si++) { composer = document.querySelector(sels[si]); if (composer) break; }
+                ${buildComposerLocatorScript()}
+                const composer = findComposer();
                 if (!composer) return;
                 composer.focus();
                 document.execCommand('insertText', false, ${JSON.stringify(text)});
@@ -988,6 +1206,14 @@ export async function sendChatGPTMessage(page, text) {
         `);
     }
 
+    return true;
+}
+
+/**
+ * Submit the current ChatGPT composer contents.
+ * Returns true if the message was sent successfully.
+ */
+async function submitChatGPTMessage(page) {
     let sent = null;
     for (let attempt = 0; attempt < 20; attempt += 1) {
         await page.wait(0.5);
@@ -1004,8 +1230,12 @@ export async function sendChatGPTMessage(page, text) {
                     && isVisible(button)
                     && !button.disabled
                     && button.getAttribute('aria-disabled') !== 'true';
-                const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
-                const root = form || document.body;
+                const composer = (() => {
+                    ${buildComposerLocatorScript()}
+                    return findComposer();
+                })();
+                if (!composer) return { sendBtnFound: false };
+                const root = composer.closest('form') || document.body;
                 const primary = root.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)})
                     || ${JSON.stringify(SEND_BUTTON_FALLBACK_SELECTORS)}.map(selector => root.querySelector(selector)).find(Boolean);
                 const btns = Array.from(root.querySelectorAll('button'));
@@ -1041,8 +1271,12 @@ export async function sendChatGPTMessage(page, text) {
                 && isVisible(button)
                 && !button.disabled
                 && button.getAttribute('aria-disabled') !== 'true';
-            const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
-            const root = form || document.body;
+            const composer = (() => {
+                ${buildComposerLocatorScript()}
+                return findComposer();
+            })();
+            if (!composer) return { ready: false };
+            const root = composer.closest('form') || document.body;
             const primary = root.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)})
                 || ${JSON.stringify(SEND_BUTTON_FALLBACK_SELECTORS)}.map(selector => root.querySelector(selector)).find(Boolean);
             const labels = ${JSON.stringify(SEND_BUTTON_LABELS)};
@@ -1060,8 +1294,23 @@ export async function sendChatGPTMessage(page, text) {
     return true;
 }
 
-export async function getVisibleMessages(page) {
+/**
+ * Send a message to the ChatGPT composer and submit it.
+ * Returns true if the message was sent successfully.
+ */
+export async function sendChatGPTMessage(page, text) {
+    const filled = await fillChatGPTMessage(page, text);
+    if (!filled) return false;
+    return submitChatGPTMessage(page);
+}
+
+export async function getVisibleMessages(page, { textOnly = false } = {}) {
+    // textOnly skips the per-turn innerHTML read (used only for --markdown
+    // rendering) so poll loops that need only role + text don't allocate a
+    // second conversation-sized string on every tick.
+    const includeHtml = textOnly ? 'false' : 'true';
     const result = requireArrayEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        const includeHtml = ${includeHtml};
         const isVisible = (el) => {
             if (!(el instanceof HTMLElement)) return false;
             const style = window.getComputedStyle(el);
@@ -1072,6 +1321,9 @@ export async function getVisibleMessages(page) {
         const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
         const roleOf = (node) => {
             const attr = node.getAttribute('data-message-author-role') || node.getAttribute('data-author') || '';
+            const searchKey = node.getAttribute('data-chatgpt-search-unit-key') || '';
+            if (/:assistant$/.test(searchKey)) return 'Assistant';
+            if (/:user$/.test(searchKey)) return 'User';
             if (/assistant/i.test(attr)) return 'Assistant';
             if (/user/i.test(attr)) return 'User';
             const testid = node.getAttribute('data-testid') || '';
@@ -1083,7 +1335,7 @@ export async function getVisibleMessages(page) {
             return '';
         };
 
-        let nodes = Array.from(document.querySelectorAll('[data-message-author-role], article[data-testid*="conversation-turn"]'));
+        let nodes = Array.from(document.querySelectorAll('[data-message-author-role], article[data-testid*="conversation-turn"], [data-chatgpt-search-unit-key]'));
         nodes = nodes.filter((node) => node instanceof HTMLElement && isVisible(node));
 
         const rows = [];
@@ -1094,16 +1346,25 @@ export async function getVisibleMessages(page) {
             if (!role && roleNode) role = roleOf(roleNode);
             if (!role) continue;
 
-            const contentNode = node.querySelector('[data-message-author-role] .markdown')
+            let contentNode = node.querySelector('[data-markdown-copy="contents"], [data-markdown-text-style="assistant-message"], [data-user-message-bubble] [data-search-result-target]')
+                || node.querySelector('[data-message-author-role] .markdown')
                 || node.querySelector('.markdown')
                 || node.querySelector('[data-message-author-role]')
                 || node;
-            const html = contentNode instanceof HTMLElement ? (contentNode.innerHTML || '') : '';
-            const text = normalize(contentNode instanceof HTMLElement ? (contentNode.innerText || contentNode.textContent || '') : '');
+            // Deduplicate overlapping markup by node identity, preserving repeated turns.
+            if (seen.has(contentNode)) continue;
+            seen.add(contentNode);
+            // Tool chips ("Web search", "Deep research") render inside the user prompt; drop them so it matches the sent text.
+            if (role === 'User' && contentNode.querySelector('[data-prompt-link-href]')) {
+                contentNode = contentNode.cloneNode(true);
+                contentNode.querySelectorAll('[data-prompt-link-href]').forEach((pill) => pill.remove());
+            }
+            const html = includeHtml && contentNode instanceof HTMLElement ? (contentNode.innerHTML || '') : '';
+            const rawText = contentNode instanceof HTMLElement
+                ? (includeHtml ? (contentNode.innerText || contentNode.textContent || '') : (contentNode.textContent || ''))
+                : '';
+            const text = normalize(rawText);
             if (!text) continue;
-            const key = role + '\\n' + text;
-            if (seen.has(key)) continue;
-            seen.add(key);
             rows.push({ role, text, html });
         }
         return rows;
@@ -1170,7 +1431,7 @@ export async function waitForChatGPTDetailRows(page, { wantMarkdown = false, tim
             lastKey = key;
             stableStartedAt = 0;
         }
-        await page.wait(3);
+        await page.sleep(3);
     }
 
     throw new TimeoutError(
@@ -1243,6 +1504,11 @@ function extractDeepResearchSourcesFromReportMessage(reportMessage) {
         if (reference?.matched_text) addSource({ title: reference.matched_text, url: reference.url }, 'matched content reference');
         if (reference?.metadata) addSource(reference.metadata, 'content reference metadata');
     }
+    // Deep Research reports now cite through metadata.citations[].metadata.
+    for (const citation of Array.isArray(metadata.citations) ? metadata.citations : []) {
+        const url = String(citation?.metadata?.url || '').split('#')[0];
+        if (url) addSource({ title: citation.metadata.title, url }, 'citation');
+    }
     for (const url of safeUrls) addSource(typeof url === 'string' ? { url } : url, 'safe URL');
     for (const group of groups) {
         for (const entry of [
@@ -1256,23 +1522,145 @@ function extractDeepResearchSourcesFromReportMessage(reportMessage) {
     return [...byUrl.values()].slice(0, 200);
 }
 
-function extractDeepResearchFromWidgetState(widgetState, source = 'conversation-widget-state') {
+function pickFirstObject(...values) {
+    for (const value of values) {
+        const parsed = parseJsonMaybe(value);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    }
+    return {};
+}
+
+function stringOrEmpty(value) {
+    return value === undefined || value === null ? '' : String(value);
+}
+
+function compactDeepResearchPlanSteps(plan, stepStatusesByPlan) {
+    const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+    return steps.slice(0, 50).map((step, index) => {
+        const id = stringOrEmpty(step?.id || step?.step_id || step?.plan_step_id || step?.key || index);
+        return {
+            id,
+            title: stringOrEmpty(step?.title || step?.name || step?.summary || step?.description),
+            status: stringOrEmpty(step?.status || step?.step_status || stepStatusesByPlan?.[id] || ''),
+        };
+    }).filter((step) => step.id || step.title || step.status);
+}
+
+function deepResearchProgressStatus(progress) {
+    const venusStatus = String(progress.venusStatus || '').toLowerCase();
+    if (/waiting_for_user|user_response/.test(venusStatus)) return 'waiting_for_user';
+    if (/needs_user|user_action|action_required|requires_action/.test(venusStatus)) return 'needs_user_action';
+    if (/running|in_progress|loading|generating|researching|queued|started|processing/.test(venusStatus)) return 'running';
+
+    const venusMessageType = String(progress.venusMessageType || '').toLowerCase();
+    if (/loading|running|generating|research|progress/.test(venusMessageType)) return 'running';
+
+    if (progress.asyncTaskConversationId
+        || progress.widgetSessionId
+        || progress.asyncStatus !== undefined
+        || progress.venusStatus
+        || progress.planId
+        || progress.planTitle) {
+        return 'not_ready';
+    }
+    return '';
+}
+
+function buildDeepResearchProgressResult(state, responseMetadata, source) {
+    const widgetState = state && typeof state === 'object' ? state : {};
+    const response = responseMetadata && typeof responseMetadata === 'object' ? responseMetadata : {};
+    const plan = pickFirstObject(widgetState.plan, widgetState.current_plan, widgetState.research_plan);
+    const stepStatusesByPlan = pickFirstObject(
+        widgetState.step_statuses_by_plan,
+        widgetState.stepStatusesByPlan,
+        widgetState.step_statuses,
+    );
+    const progress = {
+        asyncTaskConversationId: stringOrEmpty(
+            response.async_task_conversation_id
+            || response.asyncTaskConversationId
+            || response['openai/asyncTaskConversationId'],
+        ),
+        widgetSessionId: stringOrEmpty(
+            response['openai/widgetSessionId']
+            || response.widget_session_id
+            || response.widgetSessionId,
+        ),
+        asyncStatus: response['openai/asyncStatus'] ?? response.async_status ?? response.asyncStatus,
+        venusMessageType: stringOrEmpty(response.venus_message_type || response.venusMessageType),
+        venusStatus: stringOrEmpty(widgetState.status || widgetState.venus_status || widgetState.venusStatus),
+        waitingForUserUntil: stringOrEmpty(
+            widgetState.waiting_for_user_response_on_plan_until
+            || widgetState.waitingForUserResponseOnPlanUntil
+            || widgetState.waiting_for_user_until,
+        ),
+        planId: stringOrEmpty(plan.plan_id || plan.planId || plan.id),
+        planTitle: stringOrEmpty(plan.title || plan.name),
+        planSteps: compactDeepResearchPlanSteps(plan, stepStatusesByPlan),
+        stepStatusesByPlan,
+    };
+    const status = deepResearchProgressStatus(progress);
+    if (!status) return null;
+
+    if (/^completed$/i.test(progress.venusStatus)
+        && !progress.asyncTaskConversationId
+        && !progress.widgetSessionId
+        && progress.asyncStatus === undefined
+        && !progress.venusMessageType
+        && !progress.planId
+        && !progress.planTitle
+        && !progress.planSteps.length
+        && !Object.keys(progress.stepStatusesByPlan || {}).length) {
+        return null;
+    }
+
+    return {
+        status,
+        report: '',
+        html: '',
+        method: source.includes('widget-state') ? source.replace('widget-state', 'widget-progress') : `${source}-progress`,
+        sources: [],
+        progress,
+        asyncTaskConversationId: progress.asyncTaskConversationId,
+        widgetSessionId: progress.widgetSessionId,
+        asyncStatus: progress.asyncStatus,
+        venusMessageType: progress.venusMessageType,
+        venusStatus: progress.venusStatus,
+        waitingForUserUntil: progress.waitingForUserUntil,
+        planId: progress.planId,
+        planTitle: progress.planTitle,
+    };
+}
+
+function deepResearchCandidateScore(candidate) {
+    if (!candidate) return 0;
+    if (candidate.status === 'completed') return 1000000 + (candidate.reportLength || candidate.report?.length || 0);
+    if (candidate.status === 'waiting_for_user' || candidate.status === 'needs_user_action') return 500000;
+    if (candidate.status === 'running') return 400000;
+    if (candidate.status === 'not_ready') return 300000;
+    return 1;
+}
+
+function extractDeepResearchFromWidgetState(widgetState, source = 'conversation-widget-state', responseMetadata = null) {
     const state = parseJsonMaybe(widgetState);
-    if (!state || typeof state !== 'object') return null;
-    const reportMessage = state.report_message || state.reportMessage || null;
+    if ((!state || typeof state !== 'object') && !responseMetadata) return null;
+    const widgetStateObject = state && typeof state === 'object' ? state : {};
+    const reportMessage = widgetStateObject.report_message || widgetStateObject.reportMessage || null;
     const parts = Array.isArray(reportMessage?.content?.parts) ? reportMessage.content.parts : [];
     const report = normalizeDeepResearchText(parts.filter((part) => typeof part === 'string').join('\n\n'));
-    if (!looksLikeDeepResearchReport(report)) return null;
-    return {
-        status: 'completed',
-        report,
-        html: '',
-        method: source,
-        sources: extractDeepResearchSourcesFromReportMessage(reportMessage),
-        widgetStatus: String(state.status || ''),
-        reportMessageId: String(reportMessage?.id || ''),
-        reportLength: report.length,
-    };
+    if (looksLikeDeepResearchReport(report)) {
+        return {
+            status: 'completed',
+            report,
+            html: '',
+            method: source,
+            sources: extractDeepResearchSourcesFromReportMessage(reportMessage),
+            widgetStatus: String(widgetStateObject.status || ''),
+            reportMessageId: String(reportMessage?.id || ''),
+            reportLength: report.length,
+        };
+    }
+    return buildDeepResearchProgressResult(widgetStateObject, pickFirstObject(responseMetadata), source);
 }
 
 function extractDeepResearchFromConversationPayload(payload, { expectedConversationId = '' } = {}) {
@@ -1292,14 +1680,33 @@ function extractDeepResearchFromConversationPayload(payload, { expectedConversat
     const candidates = [];
     for (const [messageId, node] of Object.entries(mapping)) {
         const message = node?.message || {};
-        const sdk = message?.metadata?.chatgpt_sdk;
+        const metadata = message?.metadata || {};
+        const sdk = metadata?.chatgpt_sdk || {};
+        const responseMetadata = pickFirstObject(
+            sdk?.response_metadata,
+            sdk?.responseMetadata,
+            metadata?.response_metadata,
+            metadata?.responseMetadata,
+        );
+        let sawWidgetState = false;
         for (const widgetState of [
             sdk?.widget_state,
             sdk?.widgetState,
-            message?.metadata?.widget_state,
-            message?.metadata?.widgetState,
+            metadata?.widget_state,
+            metadata?.widgetState,
         ]) {
-            const extracted = extractDeepResearchFromWidgetState(widgetState);
+            if (widgetState === undefined || widgetState === null) continue;
+            sawWidgetState = true;
+            const extracted = extractDeepResearchFromWidgetState(widgetState, 'conversation-widget-state', responseMetadata);
+            if (extracted) {
+                candidates.push({
+                    ...extracted,
+                    conversationMessageId: messageId,
+                });
+            }
+        }
+        if (!sawWidgetState && Object.keys(responseMetadata).length) {
+            const extracted = extractDeepResearchFromWidgetState(null, 'conversation-widget-state', responseMetadata);
             if (extracted) {
                 candidates.push({
                     ...extracted,
@@ -1308,12 +1715,12 @@ function extractDeepResearchFromConversationPayload(payload, { expectedConversat
             }
         }
     }
-    candidates.sort((a, b) => b.report.length - a.report.length);
+    candidates.sort((a, b) => deepResearchCandidateScore(b) - deepResearchCandidateScore(a));
     return candidates[0] || null;
 }
 
 function conversationIdFromBackendConversationUrl(url) {
-    const match = String(url || '').match(/\/backend-api\/conversation\/([^/?#]+)/);
+    const match = String(url || '').match(/\/backend-api\/conversation\/([^/?#]+)(?:[?#]|$)/);
     return match?.[1] ? decodeURIComponent(match[1]) : '';
 }
 
@@ -1321,8 +1728,9 @@ function extractDeepResearchFromNetworkEntries(entries, { expectedConversationId
     const candidates = [];
     for (const entry of Array.isArray(entries) ? entries : []) {
         const url = String(entry?.url || '');
-        if (!/\/backend-api\/conversation\//.test(url)) continue;
         const entryConversationId = conversationIdFromBackendConversationUrl(url);
+        // Sub-resources (/conversation/<id>/stream_status, textdocs…) carry no mapping.
+        if (!entryConversationId) continue;
         if (expectedConversationId && entryConversationId !== expectedConversationId) continue;
         const body = parseJsonMaybe(entry?.responsePreview) || parseJsonMaybe(entry?.body) || null;
         if (!body) {
@@ -1332,12 +1740,14 @@ function extractDeepResearchFromNetworkEntries(entries, { expectedConversationId
         if (extracted) {
             candidates.push({
                 ...extracted,
-                method: 'network-conversation-widget-state',
+                method: extracted.status === 'completed'
+                    ? 'network-conversation-widget-state'
+                    : 'network-conversation-widget-progress',
                 networkUrl: url,
             });
         }
     }
-    candidates.sort((a, b) => b.report.length - a.report.length);
+    candidates.sort((a, b) => deepResearchCandidateScore(b) - deepResearchCandidateScore(a));
     return candidates[0] || null;
 }
 
@@ -1426,7 +1836,8 @@ async function fetchChatGPTConversationPayload(page, conversationId) {
                     };
                 }
                 errors.push('node fetch returned non-json');
-            } else if (response.status === 401 || response.status === 403) {
+            // Cookie-only requests now get 404 conversation_inaccessible instead of 401/403.
+            } else if (response.status === 401 || response.status === 403 || response.status === 404) {
                 errors.push(`node cookie fetch status ${response.status}`);
                 const bearerAuth = await buildChatGPTConversationHeaders(page, { includeAuthorization: true });
                 if (bearerAuth.ok) {
@@ -1571,6 +1982,7 @@ export async function getChatGPTDeepResearchResult(page, { conversationId = '', 
             );
         }
     }
+    let progressCandidate = null;
     const diagnostics = {
         iframeCount: Array.isArray(iframeState.iframes) ? iframeState.iframes.length : 0,
         iframe: iframe ? {
@@ -1606,19 +2018,26 @@ export async function getChatGPTDeepResearchResult(page, { conversationId = '', 
             const extracted = extractDeepResearchFromNetworkEntries(relevantEntries, { expectedConversationId: conversationId });
             if (extracted) {
                 diagnostics.networkConversation = {
-                    foundReport: true,
+                    foundReport: extracted.status === 'completed',
+                    foundProgress: extracted.status !== 'completed',
+                    status: extracted.status,
                     reportLength: extracted.reportLength || extracted.report.length,
                     sourceCount: Array.isArray(extracted.sources) ? extracted.sources.length : 0,
+                    venusStatus: extracted.venusStatus || '',
+                    asyncTaskConversationId: extracted.asyncTaskConversationId || '',
                 };
-                return {
-                    status: 'completed',
-                    report: extracted.report,
-                    html: '',
-                    url: iframeState.url,
-                    method: extracted.method,
-                    sources: extracted.sources || [],
-                    diagnostics,
-                };
+                if (extracted.status === 'completed') {
+                    return {
+                        status: 'completed',
+                        report: extracted.report,
+                        html: '',
+                        url: iframeState.url,
+                        method: extracted.method,
+                        sources: extracted.sources || [],
+                        diagnostics,
+                    };
+                }
+                progressCandidate = extracted;
             }
         } catch (error) {
             if (error instanceof CommandExecutionError) throw error;
@@ -1641,12 +2060,16 @@ export async function getChatGPTDeepResearchResult(page, { conversationId = '', 
                     status: conversation?.status || 0,
                     contentType: conversation?.contentType || '',
                     transport: conversation?.transport || '',
-                    foundReport: !!extracted,
+                    foundReport: extracted?.status === 'completed',
+                    foundProgress: !!extracted && extracted.status !== 'completed',
+                    deepResearchStatus: extracted?.status || '',
                     reportLength: extracted?.reportLength || 0,
                     widgetStatus: extracted?.widgetStatus || '',
+                    venusStatus: extracted?.venusStatus || '',
+                    asyncTaskConversationId: extracted?.asyncTaskConversationId || '',
                     sourceCount: Array.isArray(extracted?.sources) ? extracted.sources.length : 0,
                 };
-                if (extracted) {
+                if (extracted?.status === 'completed') {
                     return {
                         status: 'completed',
                         report: extracted.report,
@@ -1657,11 +2080,20 @@ export async function getChatGPTDeepResearchResult(page, { conversationId = '', 
                         diagnostics,
                     };
                 }
+                if (extracted) progressCandidate = extracted;
             }
         } catch (error) {
             if (error instanceof CommandExecutionError) throw error;
             diagnostics.conversationError = String(error?.message || error);
         }
+    }
+
+    if (progressCandidate) {
+        return {
+            ...progressCandidate,
+            url: iframeState.url,
+            diagnostics,
+        };
     }
 
     if (iframe?.text && looksLikeDeepResearchReport(iframe.text)) {
@@ -1821,8 +2253,10 @@ export async function waitForChatGPTDeepResearchResult(page, { conversationId = 
                 lastReport = result.report;
                 stableStartedAt = Date.now();
             }
+        } else if (result.status !== 'running' && result.status !== 'not_ready') {
+            return result;
         }
-        await page.wait(3);
+        await page.sleep(3);
     }
 
     throw new TimeoutError(
@@ -1913,7 +2347,7 @@ export async function waitForChatGPTResponse(page, baselineCount, prompt, timeou
     const baselinePairCounts = normalizeBaselinePairCounts(options);
 
     while (Date.now() - startTime < timeoutSeconds * 1000) {
-        await page.wait(3);
+        await page.sleep(3);
         if (options.conversationUrl) {
             const currentUrl = await currentChatGPTUrl(page);
             if (currentUrl && !isSameChatGPTConversation(currentUrl, options.conversationUrl)) {
@@ -1927,7 +2361,7 @@ export async function waitForChatGPTResponse(page, baselineCount, prompt, timeou
             continue;
         }
 
-        const messages = await getVisibleMessages(page);
+        const messages = await getVisibleMessages(page, { textOnly: true });
         const candidate = findLatestNewAssistantResponse(messages, prompt, baselinePairCounts);
         if (!candidate || candidate === String(prompt || '').trim()) continue;
 
@@ -1943,7 +2377,7 @@ export async function waitForChatGPTResponse(page, baselineCount, prompt, timeou
     throw new TimeoutError(
         'chatgpt ask',
         timeoutSeconds,
-        'No ChatGPT response appeared before timeout. Re-run with a higher --timeout if it is still generating.',
+        'Your message may already be submitted. Check "opencli chatgpt read" before sending again. For future requests, use a higher --timeout.',
     );
 }
 
@@ -1954,7 +2388,7 @@ export async function getConversationList(page) {
 
     const openSidebar = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
         const button = Array.from(document.querySelectorAll('button'))
-            .find((node) => /open sidebar/i.test(node.getAttribute('aria-label') || ''));
+            .find((node) => /^(?:open|show) sidebar$|^(?:打开|展开)(?:侧边栏|边栏)$/i.test(node.getAttribute('aria-label') || ''));
         if (button instanceof HTMLElement) {
             button.click();
             return true;
@@ -2057,19 +2491,31 @@ export async function prepareChatGPTImagePaths(imagePaths) {
 async function waitForChatGPTUploadPreview(page, fileNames) {
     const namesJson = JSON.stringify(fileNames);
     for (let attempt = 0; attempt < 10; attempt += 1) {
-        await page.wait(1);
+        await page.sleep(1);
         const ready = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
             (() => {
                 const names = ${namesJson};
-                const text = document.body ? (document.body.innerText || '') : '';
-                const matchedNames = names.filter(name => text.includes(name)).length;
-                if (matchedNames >= names.length) return true;
-
                 const composer = document.querySelector('[aria-label="Chat with ChatGPT"], [placeholder="Ask anything"], #prompt-textarea');
+                if (!composer) return false;
                 let root = composer;
-                for (let i = 0; i < 6 && root && root.parentElement; i += 1) root = root.parentElement;
-                const scope = root || document.body;
-                if (!scope) return false;
+                for (let i = 0; i < 6 && root.parentElement; i += 1) root = root.parentElement;
+                const scope = composer.closest('form') || root;
+                const text = scope.innerText || '';
+                if (names.every(name => text.includes(name))) return true;
+
+                // Some attachment chips expose their filename only as an accessible name.
+                // Match the exact name in the composer, not a historical message or control.
+                const chips = Array.from(scope.querySelectorAll('[role="group"][aria-label], [data-composer-attachments] button[aria-label]')).filter(node => {
+                    if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) return false;
+                    for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+                        const style = getComputedStyle(ancestor);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                    }
+                    return true;
+                });
+                if (names.every(name => chips.some(node => node.getAttribute('aria-label') === name))) return true;
 
                 const isVisibleMedia = (node) => {
                     if (!(node instanceof HTMLElement)) return false;
@@ -2091,8 +2537,97 @@ async function waitForChatGPTUploadPreview(page, fileNames) {
     return false;
 }
 
-export async function uploadChatGPTImages(page, imagePaths) {
+async function uploadChatGPTChunkedFiles(page, paths, selector, mimeForPath) {
     const fs = await import('node:fs');
+    const path = await import('node:path');
+    if (typeof page.evaluateOnce !== 'function') {
+        throw new CommandExecutionError('File upload fallback requires a browser backend with evaluateOnce support.');
+    }
+    if (paths.some(file => fs.default.statSync(file).size > 25 * 1024 * 1024)) {
+        return { ok: false, reason: 'Uploads over 25 MB require a current Browser Bridge extension with native file-input support' };
+    }
+    // Base64 can exceed the daemon's 1 MB request limit. Stage bounded,
+    // idempotent chunks on the pinned input, then assign files only once.
+    const chunkSize = 192 * 1024;
+    const files = paths.map(absPath => ({
+        name: path.default.basename(absPath),
+        mime: mimeForPath(absPath),
+        bytes: fs.default.readFileSync(absPath),
+    }));
+    let fallbackResult;
+    try {
+        await page.evaluate(`(() => {
+            const input = document.querySelector(${JSON.stringify(selector)});
+            if (!(input instanceof HTMLInputElement)) throw new Error('Pinned file input disappeared');
+            input.__opencliFileChunks = ${JSON.stringify(files.map(file => ({ name: file.name, mime: file.mime, count: Math.max(1, Math.ceil(file.bytes.length / chunkSize)), chunks: [] })))};
+            return true;
+        })()`);
+        for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+            const bytes = files[fileIndex].bytes;
+            const count = Math.max(1, Math.ceil(bytes.length / chunkSize));
+            for (let index = 0; index < count; index += 1) {
+                const chunk = bytes.subarray(index * chunkSize, (index + 1) * chunkSize).toString('base64');
+                await page.evaluate(`(() => {
+                    const input = document.querySelector(${JSON.stringify(selector)});
+                    if (!input?.__opencliFileChunks) throw new Error('Pinned file input disappeared');
+                    input.__opencliFileChunks[${fileIndex}].chunks[${index}] = ${JSON.stringify(chunk)};
+                    return true;
+                })()`);
+            }
+        }
+        fallbackResult = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluateOnce(`
+        (() => {
+            const input = document.querySelector(${JSON.stringify(selector)});
+            const files = input?.__opencliFileChunks;
+            if (!Array.isArray(files)) return { ok: false, reason: 'staged file data is missing' };
+            if (!(input instanceof HTMLInputElement)) {
+                return { ok: false, reason: 'file input not found' };
+            }
+
+            const dt = new DataTransfer();
+            for (const item of files) {
+                if (item.chunks.length !== item.count || Array.from({ length: item.count }, (_, index) => item.chunks[index]).some(chunk => typeof chunk !== 'string')) {
+                    return { ok: false, reason: 'staged file data is incomplete' };
+                }
+                const parts = item.chunks.map(chunk => {
+                    const binary = atob(chunk);
+                    return Uint8Array.from(binary, char => char.charCodeAt(0));
+                });
+                dt.items.add(new File(parts, item.name, { type: item.mime }));
+            }
+            input.files = dt.files;
+
+            const propsKey = Object.keys(input).find(key => key.startsWith('__reactProps$'));
+            if (propsKey && input[propsKey] && typeof input[propsKey].onChange === 'function') {
+                const nativeEvent = new Event('change', { bubbles: true });
+                input[propsKey].onChange({
+                    target: input,
+                    currentTarget: input,
+                    nativeEvent,
+                    preventDefault() {},
+                    stopPropagation() {},
+                    isDefaultPrevented() { return false; },
+                    isPropagationStopped() { return false; },
+                    persist() {},
+                });
+            } else {
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            return { ok: true };
+        })()
+    `)), 'chatgpt file upload fallback');
+    } finally {
+        await page.evaluate(`(() => {
+            const input = document.querySelector(${JSON.stringify(selector)});
+            if (input) delete input.__opencliFileChunks;
+            return true;
+        })()`);
+    }
+    return fallbackResult;
+}
+
+export async function uploadChatGPTImages(page, imagePaths) {
     const path = await import('node:path');
     const prepared = await prepareChatGPTImagePaths(imagePaths);
     if (!prepared.ok) return prepared;
@@ -2107,55 +2642,14 @@ export async function uploadChatGPTImages(page, imagePaths) {
             uploaded = true;
         } catch (err) {
             const msg = String(err?.message || err);
-            if (!msg.includes('Unknown action') && !msg.includes('not supported') && !msg.includes('Not allowed') && !msg.includes('No element found')) {
+            if (!msg.includes('Unknown action') && !msg.includes('not supported') && !msg.includes('Not allowed') && !msg.includes('No element found') && !msg.includes('fileChooserOpened not received')) {
                 throw err;
             }
         }
     }
 
     if (!uploaded) {
-        const files = absPaths.map(absPath => ({
-            name: path.default.basename(absPath),
-            mime: imageMimeFromPath(absPath),
-            base64: fs.default.readFileSync(absPath).toString('base64'),
-        }));
-        const fallbackResult = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
-            (() => {
-                const files = ${JSON.stringify(files)};
-                const input = document.querySelector('input[type="file"]');
-                if (!(input instanceof HTMLInputElement)) {
-                    return { ok: false, reason: 'file input not found' };
-                }
-
-                const dt = new DataTransfer();
-                for (const item of files) {
-                    const binary = atob(item.base64);
-                    const bytes = new Uint8Array(binary.length);
-                    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-                    dt.items.add(new File([bytes], item.name, { type: item.mime }));
-                }
-                input.files = dt.files;
-
-                const propsKey = Object.keys(input).find(key => key.startsWith('__reactProps$'));
-                if (propsKey && input[propsKey] && typeof input[propsKey].onChange === 'function') {
-                    const nativeEvent = new Event('change', { bubbles: true });
-                    input[propsKey].onChange({
-                        target: input,
-                        currentTarget: input,
-                        nativeEvent,
-                        preventDefault() {},
-                        stopPropagation() {},
-                        isDefaultPrevented() { return false; },
-                        isPropagationStopped() { return false; },
-                        persist() {},
-                    });
-                } else {
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-                return { ok: true };
-            })()
-        `)), 'chatgpt image upload fallback');
+        const fallbackResult = await uploadChatGPTChunkedFiles(page, absPaths, 'input[type="file"]', imageMimeFromPath);
         if (fallbackResult && !fallbackResult.ok) return fallbackResult;
     }
 
@@ -2165,21 +2659,170 @@ export async function uploadChatGPTImages(page, imagePaths) {
     return { ok: true, files: absPaths };
 }
 
+const CHATGPT_ATTACHMENT_CARD_JS = `
+    const attachmentCard = (node, scope) => {
+        let card = node;
+        for (let current = node; current && current !== scope; current = current.parentElement) {
+            if (current.matches('[class~="group/composer-attachment"]')) return current;
+            if (current.getAttribute('role') === 'group') card = current;
+        }
+        return card;
+    };
+`;
+
+/** Attach documents to the active composer and verify new, ready attachment chips. */
+export async function uploadChatGPTFiles(page, filePaths) {
+    const path = await import('node:path');
+    const prepared = await prepareChatGPTFilePaths(filePaths);
+    if (!prepared.ok) return prepared;
+    const names = prepared.paths.map(file => path.default.basename(file));
+    if (new Set(names).size !== names.length) return { ok: false, reason: 'Attachments must have distinct filenames' };
+    const target = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        ${buildComposerLocatorScript()}
+        const composer = findComposer();
+        const scope = composer?.closest('form');
+        if (!scope) return { ok: false, reason: 'active composer form not found' };
+        document.querySelectorAll('[data-opencli-file-input]').forEach(node => node.removeAttribute('data-opencli-file-input'));
+        // A portal input is allowed only when it is the sole eligible input on the page.
+        document.querySelectorAll('[data-opencli-file-scope]').forEach(node => node.removeAttribute('data-opencli-file-scope'));
+        scope.setAttribute('data-opencli-file-scope', '1');
+        const fileTypes = ${JSON.stringify(prepared.paths.map(file => ({ ext: path.default.extname(file).toLowerCase(), mime: mimeFromFilePath(file) })))};
+        const acceptsFiles = node => {
+            if (node.disabled || node.hasAttribute('capture') || (fileTypes.length > 1 && !node.multiple)) return false;
+            const accept = (node.getAttribute('accept') || '').toLowerCase().split(',').map(value => value.trim()).filter(Boolean);
+            return !accept.length || fileTypes.every(file => accept.some(type => type === '*/*' || type === file.ext || type === file.mime || type.endsWith('/*') && file.mime.startsWith(type.slice(0, -1))));
+        };
+        const local = Array.from(scope.querySelectorAll('input[type="file"]')).filter(acceptsFiles);
+        const inputs = local.length ? local : Array.from(document.querySelectorAll('input[type="file"]'))
+            .filter(node => acceptsFiles(node) && !node.closest('form, [role="dialog"], [data-project-home-sources-surface]'));
+        if (inputs.length !== 1) return { ok: false, reason: 'file input is missing or ambiguous' };
+        inputs[0].setAttribute('data-opencli-file-input', '1');
+        ${CHATGPT_ATTACHMENT_CARD_JS}
+        scope.querySelectorAll('[role="group"][aria-label], [data-composer-attachments] button[aria-label], [data-composer-attachments] [role="button"][aria-label]').forEach(node => attachmentCard(node, scope).setAttribute('data-opencli-existing-file', '1'));
+        return { ok: true };
+    })()`)), 'chatgpt file input targeting');
+    if (!target.ok) return target;
+    let uploaded = false;
+    if (typeof page.setFileInput === 'function') {
+        try {
+            await page.setFileInput(prepared.paths, '[data-opencli-file-input="1"]');
+            uploaded = true;
+        } catch (error) {
+            // These failures occur before native file assignment. Do not retry
+            // arbitrary transport failures that could have already uploaded.
+            if (!/Not allowed|not supported|Unknown action|fileChooserOpened not received/.test(String(error?.message || error))) throw error;
+        }
+    }
+    if (!uploaded) {
+        const fallbackResult = await uploadChatGPTChunkedFiles(page, prepared.paths, '[data-opencli-file-input="1"]', mimeFromFilePath);
+        if (fallbackResult && !fallbackResult.ok) return fallbackResult;
+    }
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+        await page.sleep(1);
+        const ready = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+            ${buildComposerLocatorScript()}
+            const scope = document.querySelector('[data-opencli-file-scope="1"]');
+            if (!scope || findComposer()?.closest('form') !== scope) return false;
+            ${CHATGPT_ATTACHMENT_CARD_JS}
+            const names = ${JSON.stringify(names)};
+            const chips = Array.from(scope.querySelectorAll('[role="group"][aria-label], [data-composer-attachments] button[aria-label], [data-composer-attachments] [role="button"][aria-label]')).filter(node => {
+                if (node.closest('[data-opencli-existing-file]') || node.closest('[hidden], [aria-hidden="true"]')) return false;
+                const card = attachmentCard(node, scope);
+                if (!isVisible(node) || card.matches('[aria-busy="true"]') || card.querySelector('[role="progressbar"], [aria-busy="true"], [role="alert"]')) return false;
+                for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+                    const style = getComputedStyle(ancestor);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                }
+                return true;
+            });
+            const assigned = new Map();
+            const matchesName = (label, name) => {
+                if (label === name) return true;
+                const dot = name.lastIndexOf('.');
+                const base = dot > 0 ? name.slice(0, dot) : name;
+                const ext = dot > 0 ? name.slice(dot) : '';
+                if (!label.startsWith(base) || !label.endsWith(ext)) return false;
+                const suffix = label.slice(base.length, ext ? -ext.length : undefined).trim();
+                return /^\\(\\d+\\)$/.test(suffix);
+            };
+            const assign = (nameIndex, seen) => {
+                const name = names[nameIndex];
+                const candidates = chips.filter(node => matchesName(node.getAttribute('aria-label') || '', name));
+                candidates.sort((a, b) => Number(b.getAttribute('aria-label') === name) - Number(a.getAttribute('aria-label') === name));
+                for (const node of candidates) {
+                    const card = attachmentCard(node, scope);
+                    if (seen.has(card)) continue;
+                    seen.add(card);
+                    if (!assigned.has(card) || assign(assigned.get(card), seen)) {
+                        assigned.set(card, nameIndex);
+                        return true;
+                    }
+                }
+                return false;
+            };
+            return names.every((_, index) => assign(index, new Set()));
+        })()`)), 'chatgpt file attachment readiness');
+        if (ready) return { ok: true, files: prepared.paths };
+    }
+    return { ok: false, reason: 'new ready attachment chips did not appear in the active composer; prompt was not sent' };
+}
+
 /**
  * Check if ChatGPT is still generating a response.
  */
 export async function isGenerating(page) {
+    // Deliberately avoids document.body.innerText: reading it forces a full-page
+    // layout/reflow and allocates a conversation-sized string on every poll,
+    // which during a 10-20 min streamed answer pins the renderer at high CPU.
+    // Cheap signals only — control aria-labels, the stop-button test id, and a
+    // textContent (no reflow) scan scoped to the composer + last turn.
     return requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
         (() => {
-            const text = (document.body?.innerText || '').replace(/\\s+/g, ' ');
-            if (/正在思考|停止生成|Thinking/.test(text)) return true;
-            return Array.from(document.querySelectorAll('button')).some(b => {
-                const label = b.getAttribute('aria-label') || '';
-                return label === 'Stop generating'
-                    || label.includes('Thinking')
+            if (document.querySelector('[data-testid="stop-button"]')) return true;
+            // No bare 'Thinking' here: the model picker renders 'Thinking' as
+            // an idle model label (see CHATGPT_MODEL_TARGETS.advanced), and an
+            // English streaming state always comes with the stop button above.
+            const controls = Array.from(document.querySelectorAll('button, [role="button"], [aria-label]'));
+            for (const control of controls) {
+                const label = control.getAttribute('aria-label') || '';
+                if (label.includes('Stop generating')
                     || label.includes('停止生成')
-                    || label.includes('正在思考');
-            });
+                    || label.includes('正在思考')) return true;
+            }
+            // The "正在思考 / Thinking" pill can render as plain text without an
+            // aria-label. Scope the text scan to small containers and use
+            // textContent (does not trigger layout) instead of body.innerText.
+            const scopes = [];
+            // Cover both message shapes from CONVERSATION_MESSAGE_SELECTOR:
+            // prefer the article turn (the wider container, so a pill outside
+            // the message div is still seen), fall back to bare
+            // [data-message-author-role] nodes when articles are absent.
+            // Bare 'Thinking' only counts inside the last turn — the composer
+            // area shows 'Thinking' as an idle model label.
+            const turns = document.querySelectorAll('article[data-testid*="conversation-turn"], [data-chatgpt-search-unit-key]');
+            const messages = turns.length ? turns : document.querySelectorAll('[data-message-author-role]');
+            if (messages.length) scopes.push([messages[messages.length - 1], /正在思考|停止生成|Thinking/]);
+            const composer = document.querySelector('#prompt-textarea, [aria-label="Chat with ChatGPT"]');
+            if (composer) {
+                let root = composer;
+                for (let i = 0; i < 4 && root.parentElement; i += 1) root = root.parentElement;
+                scopes.push([root, /正在思考|停止生成/]);
+            }
+            // Only a short leaf element OUTSIDE rendered message content
+            // counts as a status pill. Testing whole scope text would flag any
+            // answer that merely *mentions* "Thinking" (prose or a backticked
+            // code span in a conversation about this very code) as still
+            // generating, permanently blocking follow-up sends.
+            for (const [scope, pattern] of scopes) {
+                for (const el of [scope, ...scope.querySelectorAll('*')]) {
+                    if (el.children.length) continue;
+                    if (el.closest('.markdown, pre, code')) continue;
+                    const text = (el.textContent || '').trim();
+                    if (text && text.length <= 40 && pattern.test(text)) return true;
+                }
+            }
+            return false;
         })()
     `)), 'chatgpt generation state');
 }
@@ -2225,15 +2868,31 @@ export async function getChatGPTVisibleImageUrls(page) {
                 return /avatar|profile|logo|icon/.test(text);
             };
             const isUserUploadPreview = (img) => {
-                const alt = (img.getAttribute('alt') || '').toLowerCase();
                 const turn = img.closest('section[data-testid^="conversation-turn"]');
-                const heading = (turn?.querySelector('h4')?.innerText || '').toLowerCase();
+                // Authoritative signal first: ChatGPT stamps data-turn directly on the
+                // turn section as soon as the turn mounts, well before an attached
+                // image's alt text/aria-label finish populating. Racing multiple
+                // uploads against that async metadata (the old behaviour here) let
+                // still-generic upload-preview thumbnails pass as "new" images for a
+                // poll or two, which is long enough to satisfy the stability check in
+                // waitForChatGPTImages and return the wrong (uploaded, not generated)
+                // images when 2+ files were attached.
+                const turnRole = turn?.getAttribute('data-turn') || '';
+                if (turnRole === 'user') return true;
+                if (turnRole === 'assistant') return false;
+                // Fallback for markup without data-turn. innerText reads as empty
+                // on a visually-hidden heading in real Chrome (jsdom has no layout and
+                // never exposed this gap) - use textContent instead.
+                const heading = (turn?.querySelector('h4')?.textContent || '').toLowerCase();
                 if (/you said|你说/.test(heading)) return true;
                 if (/chatgpt|assistant|助手/.test(heading)) return false;
-                const openButtonLabel = (img.closest('button[aria-label^="Open image:"]')?.getAttribute('aria-label') || '').toLowerCase();
+                const alt = (img.getAttribute('alt') || '').toLowerCase();
+                // ChatGPT's multi-image "Open image" button label now reads
+                // "Open image N of M: name", not the older "Open image: name".
+                const openButtonLabel = (img.closest('button[aria-label*="Open image"], button[aria-label*="打开图片"]')?.getAttribute('aria-label') || '').toLowerCase();
                 const previewText = [alt, openButtonLabel].join(' ');
                 return /\.(png|jpe?g|webp|gif|heic|heif)(?:\b|$)/i.test(previewText)
-                    || /ref-|reference|参考|upload|uploaded|attachment/.test(previewText);
+                    || /ref-|reference|参考|上传|upload|uploaded|attachment/.test(previewText);
             };
 
             const imgs = Array.from(document.querySelectorAll('img')).filter(img =>
@@ -2268,11 +2927,10 @@ export async function getChatGPTVisibleImageUrls(page) {
             }
 
             // Some ChatGPT image surfaces mount large transparent canvases as
-            // placeholders/overlays before the real backend image is ready. If
-            // those data URLs are accepted as generated assets, the adapter can
-            // save a blank transparent PNG while reporting success. Prefer real
-            // <img>/background URLs; only keep a canvas if it contains at least
-            // one non-transparent/non-white sampled pixel.
+            // placeholders/overlays before the real backend image is ready. The
+            // image wait no longer saves these (#1898), but it does treat a
+            // content-bearing one as "still rendering", so keep the sampling:
+            // it decides whether a deadline reports TIMEOUT or EMPTY_RESULT.
             for (const canvas of Array.from(document.querySelectorAll('canvas'))) {
                 if (!(canvas instanceof HTMLCanvasElement) || !isVisible(canvas) || isDecorative(canvas)) continue;
                 const width = canvas.width || canvas.getBoundingClientRect().width || 0;
@@ -2313,36 +2971,50 @@ export async function getChatGPTVisibleImageUrls(page) {
  * Wait for new images to appear after sending a prompt.
  */
 export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, convUrl) {
+    // Local draft IDs are replaced by persisted IDs after submission. Reloading
+    // one discards the active rendering surface instead of restoring the chat.
+    const hasStableConversation = convUrl && convUrl.includes('/c/')
+        && !/\/c\/local-chatgpt(?::|%3A)/i.test(convUrl);
     const beforeSet = new Set(beforeUrls);
     const pollIntervalSeconds = 3;
     const maxPolls = Math.max(1, Math.ceil(timeoutSeconds / pollIntervalSeconds));
     let lastUrls = [];
     let stableCount = 0;
+    let stillRendering = false;
 
     for (let i = 0; i < maxPolls; i++) {
-        await page.wait(i === 0 ? 3 : pollIntervalSeconds);
+        await page.sleep(i === 0 ? 3 : pollIntervalSeconds);
 
         let currentUrl = '';
-        if (convUrl && convUrl.includes('/c/')) {
+        if (hasStableConversation) {
             currentUrl = unwrapEvaluateResult(await page.evaluate('window.location.href').catch(() => ''));
             if (currentUrl && !isSameChatGPTConversation(currentUrl, convUrl)) {
                 await page.goto(convUrl);
-                await page.wait(3);
+                await page.sleep(3);
             }
         }
 
         const generating = await isGenerating(page);
+        stillRendering = generating;
         if (generating) continue;
 
-        if (convUrl && convUrl.includes('/c/') && i > 0 && i % 5 === 0) {
+        if (hasStableConversation && i > 0 && i % 5 === 0) {
             const onConversation = !currentUrl || isSameChatGPTConversation(currentUrl, convUrl);
             if (onConversation) {
                 await page.goto(convUrl);
-                await page.wait(3);
+                await page.sleep(3);
             }
         }
 
-        const urls = (await getChatGPTVisibleImageUrls(page)).filter(url => !beforeSet.has(url));
+        const candidates = (await getChatGPTVisibleImageUrls(page)).filter(url => !beforeSet.has(url));
+        // Canvas snapshots surface as data: URLs and hold half-drawn frames
+        // while generation renders. A hidden page stops repainting the canvas,
+        // so a frozen partial frame stays byte-identical across polls and
+        // would pass the stability gate below as a finished image (#1898).
+        // Kept out of completion, they still mark the wait as rendering so a
+        // deadline reports TIMEOUT instead of EMPTY_RESULT.
+        const urls = candidates.filter(url => !/^data:/i.test(url));
+        stillRendering = urls.length === 0 && candidates.length > 0;
         if (urls.length === 0) continue;
 
         const key = urls.join('\n');
@@ -2358,6 +3030,15 @@ export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, con
             return lastUrls;
         }
     }
+    // A deadline that lands while ChatGPT is visibly mid-generation is a
+    // temporary failure, not an empty conversation. Mirror the ask wait.
+    if (!lastUrls.length && stillRendering) {
+        throw new TimeoutError(
+            'chatgpt image',
+            timeoutSeconds,
+            'No finished image appeared before timeout. Re-run with a higher --timeout if it is still generating.',
+        );
+    }
     return lastUrls;
 }
 
@@ -2372,7 +3053,7 @@ export async function getProjectList(page) {
     // Ensure sidebar is open
     const openSidebar = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
         const button = Array.from(document.querySelectorAll('button'))
-            .find((node) => /open sidebar/i.test(node.getAttribute('aria-label') || ''));
+            .find((node) => /^(?:open|show) sidebar$|^(?:打开|展开)(?:侧边栏|边栏)$/i.test(node.getAttribute('aria-label') || ''));
         if (button instanceof HTMLElement) {
             button.click();
             return true;

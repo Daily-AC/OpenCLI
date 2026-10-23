@@ -5,7 +5,8 @@
  */
 
 import { sleep } from '../utils.js';
-import { BrowserConnectError } from '../errors.js';
+import type { SlotGrantData, SlotPolicy } from '../site-slots.js';
+import { BrowserConnectError, SessionBusyError } from '../errors.js';
 import { COMMAND_RESULT_UNKNOWN_CODE, COMMAND_RESULT_UNKNOWN_HINT } from '../daemon-utils.js';
 import { classifyBrowserError } from './errors.js';
 import { profileRouteParams, resolveProfileSelection } from './profile.js';
@@ -26,6 +27,85 @@ let _idCounter = 0;
 
 function generateId(): string {
   return `cmd_${process.pid}_${Date.now()}_${++_idCounter}`;
+}
+
+/**
+ * Id for a whole logical CLI command run. Encodes the CLI pid so the daemon can
+ * name/kill the holder in a busy error (see parsePidFromRunId in session-lease.ts).
+ */
+export function generateRunId(): string {
+  return `run_${process.pid}_${Date.now()}_${++_idCounter}`;
+}
+
+/**
+ * Identity of the CLI command run currently driving the browser, attached to
+ * every command so the daemon can arbitrate the write lease. Module-level and
+ * one-per-invocation, matching `setDaemonCommandTimeoutSeconds`. Null for read
+ * and ephemeral commands, which are never lease-arbitrated.
+ */
+export interface DaemonRunContext {
+  runId: string;
+  command: string;
+  access: 'read' | 'write';
+}
+
+let _runContext: DaemonRunContext | null = null;
+
+export function setDaemonRunContext(ctx: DaemonRunContext | null): void {
+  _runContext = ctx;
+}
+
+/**
+ * Clear the run context only if it still belongs to `runId`. Used by deferred
+ * cleanup (an adapter that outlived its CLI timeout settles later): by then a
+ * newer run may own the context, and unconditionally nulling it would strip
+ * that run's lease heartbeats mid-flight.
+ */
+export function clearDaemonRunContext(runId: string): void {
+  if (_runContext?.runId === runId) _runContext = null;
+}
+
+/**
+ * Best-effort release of a persistent site-session lease on command completion.
+ * A direct one-shot POST (no bridge ensure / retry): if it never lands, the
+ * daemon's TTL reclaims the lease anyway, so this must never block the caller.
+ */
+export async function releaseSiteSessionLease(params: {
+  runId: string;
+  session: string;
+  surface: 'adapter';
+}): Promise<void> {
+  try {
+    await requestDaemon('/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: generateId(),
+        action: 'lease-release',
+        runId: params.runId,
+        session: params.session,
+        surface: params.surface,
+      }),
+      timeout: 2000,
+    });
+  } catch {
+    // Best-effort: TTL expiry reclaims the lease if the daemon is unreachable.
+  }
+}
+
+/**
+ * Borrow one slot of a pooled site for this run. Resolves to the slot's
+ * persistent session name once the daemon's admission queue grants it. The
+ * caller must have set the run context so later execs heartbeat the slot.
+ */
+export async function acquireSiteSlot(params: SlotPolicy & {
+  site: string;
+  waitMs: number;
+  contextId?: string;
+  preferredContextId?: string;
+}): Promise<SlotGrantData> {
+  // timeoutMs lifts the client HTTP deadline past the daemon's own wait timer.
+  return await sendCommand('slot-acquire', { ...params, timeoutMs: params.waitMs }) as SlotGrantData;
 }
 
 /**
@@ -66,7 +146,7 @@ function effectiveCommandTimeoutSeconds(params: Omit<DaemonCommand, 'id' | 'acti
  * journal.ts). From this version on, re-sending the SAME command id is safe:
  * the executor replays the recorded result instead of re-executing.
  */
-const MIN_JOURNAL_EXTENSION_VERSION = '1.0.22';
+export const MIN_JOURNAL_EXTENSION_VERSION = '1.0.22';
 
 function versionAtLeast(version: string | null | undefined, min: string): boolean {
   if (!version) return false;
@@ -80,8 +160,32 @@ function versionAtLeast(version: string | null | undefined, min: string): boolea
   return true;
 }
 
+export function supportsCommandJournal(version: string | null | undefined, compatRange: string | null | undefined): boolean {
+  // compatRange marks the independently versioned extension line.
+  return !!compatRange && versionAtLeast(version, MIN_JOURNAL_EXTENSION_VERSION);
+}
+
 /** Error codes meaning the executor's outcome is genuinely unknown — never auto-retry. */
 const UNKNOWN_OUTCOME_CODES = new Set(['command_result_unknown', 'command_lost', 'result_evicted']);
+
+/**
+ * True when a thrown error carries an unknown-outcome code — the browser-side
+ * command may still be running even though the client gave up. Callers use this
+ * to decide whether it is safe to release a persistent site-session lease: it is
+ * not, because the still-running command keeps mutating the tab. Walks the cause
+ * chain so a wrapped `BrowserCommandError` is still recognized.
+ */
+export function isUnknownOutcomeError(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && UNKNOWN_OUTCOME_CODES.has(code)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
 
 /** Max transport attempts for one logical command (same id throughout). */
 const TRANSPORT_MAX_ATTEMPTS = 4;
@@ -116,12 +220,18 @@ function isPreConnectFetchError(err: unknown): boolean {
   return false;
 }
 
-export interface DaemonCommand {
+export interface DaemonCommand extends Partial<SlotPolicy> {
   id: string;
-  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames';
+  action: 'chrome-call' | 'chrome-describe' | 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'close-owned-tab' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames' | 'lease-release' | 'slot-acquire';
+  retainIncomplete?: boolean;
+  /** slot-acquire: pooled site and queue wait budget (policy fields via SlotPolicy). */
+  site?: string;
+  waitMs?: number;
   /** Target page identity (targetId). Cross-layer contract with the extension. */
   page?: string;
   code?: string;
+  chromeMethod?: string;
+  chromeArgs?: unknown[];
   session?: string;
   surface?: 'browser' | 'adapter';
   /** Adapter site session lifecycle. Persistent site sessions do not idle-expire. */
@@ -177,6 +287,17 @@ export interface DaemonCommand {
    * absorbing queueing and service-worker wake latency.
    */
   deadlineAt?: number;
+  /**
+   * Stable id for the whole logical CLI command run (NOT the per-exec `id`).
+   * The daemon uses it to arbitrate a write lease on the persistent site
+   * session: the first command acquires, same-runId execs refresh it as a
+   * heartbeat, a concurrent different-runId write fails fast. See session-lease.ts.
+   */
+  runId?: string;
+  /** Human command name (e.g. `chatgpt ask`) surfaced in the busy error. */
+  command?: string;
+  /** Command access level; only 'write' commands take/hold a session lease. */
+  access?: 'read' | 'write';
 }
 
 export interface DaemonResult {
@@ -246,6 +367,15 @@ async function sendCommandRaw(
   const contextId = routing.contextId;
   const preferredContextId = routing.preferredContextId;
   const windowMode = params.windowMode ?? envWindowMode;
+  // Override the owned session idle timeout, not the container window lifetime.
+  // Explicit close still releases ephemeral sessions; persistent adapter sessions
+  // and borrowed bound tabs ignore idle timeouts. Per-command values take priority.
+  // The extension ignores 0, so only positive integers are forwarded.
+  const rawIdleTimeout = process.env.OPENCLI_BROWSER_IDLE_TIMEOUT;
+  const envIdleTimeout = rawIdleTimeout && /^\d+$/.test(rawIdleTimeout) && Number(rawIdleTimeout) > 0
+    ? Number(rawIdleTimeout)
+    : undefined;
+  const idleTimeout = params.idleTimeout ?? envIdleTimeout;
 
   let id = generateId();
   let ensureUsed = false;
@@ -256,15 +386,17 @@ async function sendCommandRaw(
     // Bound the connect wait by the command's remaining budget so repeated
     // daemon failures cannot stretch the total wall time far past --timeout.
     const remainingSeconds = Math.ceil((deadlineAt - Date.now()) / 1000);
-    const ready = await ensureBrowserBridgeReady({
+    const health = await ensureBrowserBridgeReady({
       timeoutSeconds: Math.max(1, Math.min(DEFAULT_BROWSER_CONNECT_TIMEOUT, remainingSeconds)),
-      // Only an explicit requirement pins readiness to a specific profile —
-      // waiting for a stale preferred profile to come back would hang the
-      // ensure path even though the daemon can already serve the command.
+      // Only an explicit requirement pins readiness to a specific profile; a
+      // preferred one is arbitrated against live connections on every poll,
+      // so a stale default still cannot hang the ensure path while a valid
+      // one avoids the multi-profile ambiguity error (#2259).
       contextId,
+      preferredContextId,
       verbose: false,
     });
-    executorJournaled = versionAtLeast(ready.health.status?.extensionVersion, MIN_JOURNAL_EXTENSION_VERSION);
+    executorJournaled = supportsCommandJournal(health.status?.extensionVersion, health.status?.extensionCompatRange);
   };
 
   for (let attempt = 1; attempt <= TRANSPORT_MAX_ATTEMPTS; attempt++) {
@@ -285,6 +417,15 @@ async function sendCommandRaw(
       ...(contextId && { contextId }),
       ...(preferredContextId && { preferredContextId }),
       ...(windowMode && { windowMode }),
+      ...(idleTimeout !== undefined && { idleTimeout }),
+      // Carry the run identity so the daemon can acquire/refresh the write
+      // lease on the persistent site session. The same runId across every exec
+      // of one command is the heartbeat that keeps a long-running holder alive.
+      ...(_runContext && {
+        runId: _runContext.runId,
+        command: _runContext.command,
+        access: _runContext.access,
+      }),
     };
     try {
       const res = await requestDaemon('/command', {
@@ -297,6 +438,13 @@ async function sendCommandRaw(
       const result = (await res.json()) as DaemonResult;
 
       if (result.ok) return result;
+
+      // A second concurrent write on the same persistent site session is
+      // rejected before the daemon dispatches anything — terminal, never
+      // retried, and surfaced as a CliError so the busy message is the output.
+      if (result.errorCode === 'session_busy' || result.errorCode === 'slot_wait_timeout' || result.errorCode === 'slot_conflict') {
+        throw new SessionBusyError(result.error ?? 'The site session is busy.', result.errorHint);
+      }
 
       if (result.errorCode && UNKNOWN_OUTCOME_CODES.has(result.errorCode)) {
         throw new BrowserCommandError(result.error ?? 'Browser command result is unknown', result.errorCode, result.errorHint);
@@ -333,7 +481,7 @@ async function sendCommandRaw(
 
       throw new BrowserCommandError(result.error ?? 'Daemon command failed', result.errorCode, result.errorHint);
     } catch (err) {
-      if (err instanceof BrowserCommandError || err instanceof BrowserConnectError) throw err;
+      if (err instanceof BrowserCommandError || err instanceof BrowserConnectError || err instanceof SessionBusyError) throw err;
 
       if (err instanceof Error && err.name === 'AbortError') {
         throw new BrowserCommandError(
